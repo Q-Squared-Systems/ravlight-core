@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <nvs.h>
 #include <esp_efuse.h>
+#include <esp_mac.h>
 #include <esp_timer.h>
 #include <esp_log.h>
 #include "runtime.h"

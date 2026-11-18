@@ -716,7 +716,7 @@ void initFixture() {
         if (cfg.protocol == LED_PWM || cfg.protocol == LED_RELAY) continue;  // pixel outputs only
         uint8_t ch_pp = led_ch_per_pixel(cfg.protocol);
         esp_err_t err = led_output_init(&ledStrips[i], HW_LED_OUTPUT_PINS[i], cfg.pixel_count,
-                                        (rmt_channel_t)i, 1, ch_pp);
+                                        i, 1, ch_pp);
         if (err == ESP_OK) {
             ledActive[i] = true;
             uint8_t n = led_universe_count(&cfg);

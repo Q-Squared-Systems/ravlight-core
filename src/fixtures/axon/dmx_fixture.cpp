@@ -83,7 +83,7 @@ void initFixture() {
             continue;
         }
         if (led_output_init(&strips[i], HW_LED_OUTPUT_PINS[i], cfg.pixel_count,
-                            (rmt_channel_t)(RMT_CHANNEL_0 + i),
+                            i,
                             /*mem_blocks=*/1,
                             /*channels=*/led_ch_per_pixel(cfg.protocol)) == ESP_OK) {
             stripActive[i] = true;

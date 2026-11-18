@@ -292,7 +292,7 @@ void initFixture() {
             // RMT-owned: led_output_init allocates the buffer internally and binds
             // RMT channel i. ESP32 classic has 8 RMT channels (0..7).
             esp_err_t err = led_output_init(&strips[i], pin, cfg.pixel_count,
-                                            (rmt_channel_t)i, 1, ch_pp);
+                                            i, 1, ch_pp);
             if (err != ESP_OK) {
                 ESP_LOGE(TAG, "ch%d led_output_init failed: %d", i, err);
                 continue;
@@ -639,7 +639,7 @@ void initFixture() {
         }
 
         uint8_t ch_pp = led_ch_per_pixel(cfg.protocol);
-        esp_err_t err = led_output_init(&strips[i], pin, cfg.pixel_count, (rmt_channel_t)i, 1, ch_pp);
+        esp_err_t err = led_output_init(&strips[i], pin, cfg.pixel_count, i, 1, ch_pp);
         if (err == ESP_OK) {
             stripActive[i] = true;
             char order_str[5];

@@ -75,7 +75,7 @@ void initFixture() {
     dmxSetCurrentPersonality((uint8_t)veyronConfig.personality);
 #endif
 
-    led_output_init(&strip1, HW_LED_OUTPUT_PINS[0], VEYRON_NUM_PIXELS_1, RMT_CHANNEL_0, 4, 3);
+    led_output_init(&strip1, HW_LED_OUTPUT_PINS[0], VEYRON_NUM_PIXELS_1, 0, 4, 3);
     p9813_init(&strip2, HW_PIN_P9813_DATA, HW_PIN_P9813_CLK, VEYRON_NUM_PIXELS_2);
     led_output_clear(&strip1);
     led_output_flush(&strip1);
