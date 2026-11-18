@@ -958,20 +958,22 @@ static void renderLedOutputs() {
     for (int i = 0; i < HW_LED_OUTPUT_COUNT; i++) {
         if (!ledActive[i]) continue;
         const led_output_cfg_t& cfg = orionConfig.ledOutputs[i];
-        uint8_t ch_pp = led_ch_per_pixel(cfg.protocol);
+        auto& strip = ledStrips[i];
+        const uint16_t pixels = strip.n_pixels;
+        const uint8_t ch_pp = strip.channels;
 
         // ── Highlight wipe (identification): a white band sweeps the strip ───────
         if (ledHlStart[i]) {
             uint32_t el = millis() - ledHlStart[i];
             if (el < ORION_LED_HL_MS) {
-                uint16_t n = cfg.pixel_count;
+                uint16_t n = pixels;
                 uint16_t head = (uint16_t)((uint32_t)el * n / ORION_LED_HL_MS);
                 uint16_t band = n / 12; if (band < 1) band = 1;
                 uint8_t on[4]  = {255, 255, 255, 255};
                 uint8_t off[4] = {0, 0, 0, 0};
                 for (uint16_t px = 0; px < n; px++) {
                     bool lit = (px <= head) && (px + band >= head);
-                    led_output_write_raw(&ledStrips[i], px, lit ? on : off);
+                    led_output_write_raw(&strip, px, lit ? on : off);
                 }
                 continue;   // skip DMX render for this output this frame
             }
@@ -981,26 +983,40 @@ static void renderLedOutputs() {
         const uint8_t* cached_ubuf = nullptr;
         uint16_t       cached_univ = 0xFFFF;
 
-        for (uint16_t px = 0; px < cfg.pixel_count; px++) {
-            uint32_t slot = px / cfg.grouping;
+        // A count or protocol change needs a reboot. Keep rendering within
+        // the size and wire format of the strip initialized at boot.
+        if (cfg.pixel_count != pixels || led_ch_per_pixel(cfg.protocol) != ch_pp)
+            continue;
+        const uint8_t grouping = cfg.grouping;
+        if (grouping == 0) continue;
+        const bool invert = cfg.invert;
+        const uint8_t brightness = cfg.brightness;
+        const uint32_t address = static_cast<uint32_t>(cfg.dmx_start) - 1;
+        const uint16_t universe = cfg.universe_start;
+
+        // All pixels in a group share one DMX lookup and color conversion.
+        for (uint32_t first = 0, slot = 0; first < pixels; first += grouping, ++slot) {
             uint8_t  logical[4] = {0, 0, 0, 0};
             bool     skip = false;
             for (uint8_t c = 0; c < ch_pp; c++) {
-                uint32_t ch_flat   = (uint32_t)(cfg.dmx_start - 1) + slot * ch_pp + c;
-                uint16_t ch_univ   = cfg.universe_start + (uint16_t)(ch_flat / 512);
+                uint32_t ch_flat   = address + slot * ch_pp + c;
+                uint16_t ch_univ   = universe + (uint16_t)(ch_flat / 512);
                 uint16_t ch_offset = (uint16_t)(ch_flat % 512);
                 if (ch_univ != cached_univ) {
                     cached_ubuf = getUniverseData(ch_univ);
                     cached_univ = ch_univ;
                 }
                 if (!cached_ubuf) { skip = true; break; }
-                logical[c] = (uint16_t)cached_ubuf[ch_offset + 1] * cfg.brightness / 255;
+                logical[c] = (uint16_t)cached_ubuf[ch_offset + 1] * brightness / 255;
             }
             if (skip) continue;
             uint8_t wire[4];
             for (uint8_t c = 0; c < ch_pp; c++) wire[c] = logical[cfg.color_order[c] & 3];
-            uint16_t out_idx = cfg.invert ? (cfg.pixel_count - 1 - px) : px;
-            led_output_write_raw(&ledStrips[i], out_idx, wire);
+            const uint32_t end = min(first + grouping, static_cast<uint32_t>(pixels));
+            for (uint32_t px = first; px < end; ++px) {
+                const uint16_t out_idx = invert ? pixels - 1 - px : px;
+                led_output_write_raw(&strip, out_idx, wire);
+            }
         }
     }
     for (int i = 0; i < HW_LED_OUTPUT_COUNT; i++)
