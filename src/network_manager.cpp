@@ -6,6 +6,10 @@
 #endif
 
 #include <WiFi.h>
+#include <esp_arduino_version.h>
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+#include <Network.h>
+#endif
 #include "webserver_manager.h"
 #include "network_manager.h"
 #include <config.h>
@@ -119,7 +123,11 @@ void WiFiEvent(WiFiEvent_t event) {
 void initEthernet() {
   fixtureSetNetStatus(NET_STATUS_CONNECTING);
 #ifdef RAVLIGHT_MODULE_ETHERNET
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  Network.onEvent(WiFiEvent);
+#else
   WiFi.onEvent(WiFiEvent);
+#endif
 #ifdef BOARD_ETH_OSC_ENABLE_PIN
   // LED Lifter v6: keep the external clock off while the PHY reset capacitor
   // discharges, then enable it and wait until the delayed reset has released.

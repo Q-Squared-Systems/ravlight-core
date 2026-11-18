@@ -6,6 +6,7 @@
 #include "discovery_udp.h"
 #include "discovery_espnow.h"
 #include <esp_now.h>
+#include <esp_idf_version.h>
 #include <WiFi.h>
 #include <Arduino.h>
 #include "config.h"
@@ -153,7 +154,13 @@ bool sendESPNowCommand(const String& hwMacStr, const String& command,
 }
 #endif // RAVLIGHT_MODULE_DISCOVERY
 
+#if ESP_IDF_VERSION_MAJOR >= 5
+static void onESPNowRecv(const esp_now_recv_info_t* packet, const uint8_t* data, int len) {
+    if (!packet || !packet->src_addr) return;
+    const uint8_t* mac = packet->src_addr;
+#else
 static void onESPNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
+#endif
     DynamicJsonDocument doc(DISC_ESPNOW_JSON_DOC_SIZE);
     if (deserializeJson(doc, data, len)) {
         Serial.println("[ESP-NOW] JSON parse failed");
