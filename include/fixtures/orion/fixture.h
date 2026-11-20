@@ -274,6 +274,11 @@ IMotorDriver* orionGetDriver();
 // (SG ring-buffer dump). Returns nullptr if the backend isn't TMC2209.
 class Tmc2209LocalDriver;
 Tmc2209LocalDriver* orionGetTmcDriver();
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+const char* orionGravityRecoveryStatus();
+const char* orionGravityRecoveryFailure();
+bool orionGravityReturnInProgress();
+#endif
 #ifdef HW_MOTOR_PASSIVE_BRAKE_TEST
 bool orionStartPassiveBrakeTest();
 bool orionStopPassiveBrakeTest(bool emergency = false);

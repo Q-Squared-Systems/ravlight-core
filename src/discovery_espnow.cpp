@@ -76,9 +76,6 @@ static void handleDiscoveryResponse(const DynamicJsonDocument& doc, const uint8_
     String mac = doc["mac"] | "";
     if (mac.isEmpty()) return;
     if (mac == getSerialNumber()) return;  // skip self
-    for (const auto& d : ScannedDevices) {
-        if (d.mac == mac) return;   // duplicate (may have already arrived via UDP)
-    }
     DeviceInfo info;
     info.id       = doc["id"]      | "n/a";
     info.mac      = mac;
@@ -94,7 +91,7 @@ static void handleDiscoveryResponse(const DynamicJsonDocument& doc, const uint8_
     snprintf(hwMacStr, sizeof(hwMacStr), "%02X:%02X:%02X:%02X:%02X:%02X",
              hwMac[0], hwMac[1], hwMac[2], hwMac[3], hwMac[4], hwMac[5]);
     info.hwMac = hwMacStr;
-    ScannedDevices.push_back(info);
+    if (!addDiscoveredDevice(info)) return;
     Serial.printf("[ESP-NOW] Device found: %s @ %s (HW MAC: %s)\n",
                   info.id.c_str(), info.ip.c_str(), info.hwMac.c_str());
 }
@@ -295,9 +292,6 @@ void onESPNowRecv(const uint8_t *macAddr, const uint8_t *incomingData, int len) 
   Serial.printf("  Uptime: %lu min\n", doc["uptime"] | 0);
 
   String mac = doc["mac"] | "";
-  for (const auto& d : ScannedDevices) {
-    if (d.mac == mac) return;
-  }
 
   DeviceInfo info;
   info.id      = doc["id"]      | "n/a";
@@ -308,7 +302,7 @@ void onESPNowRecv(const uint8_t *macAddr, const uint8_t *incomingData, int len) 
   info.fw      = doc["fw"]      | "n/a";
   info.temp    = doc["temp"]    | 0.0;
   info.uptime  = doc["uptime"]  | 0;
-  ScannedDevices.push_back(info);
+  if (!addDiscoveredDevice(info)) return;
   Serial.println("[ESP-NOW] Device added to list");
 }
 

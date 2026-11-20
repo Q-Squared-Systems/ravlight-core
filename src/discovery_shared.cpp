@@ -6,6 +6,7 @@
 #include "network_manager.h"
 #include <esp_log.h>
 #include <esp_timer.h>
+#include <mutex>
 #include <vector>
 
 #ifdef RAVLIGHT_MASTER
@@ -14,7 +15,21 @@
 
 #define TAG "DISC"
 
-std::vector<DeviceInfo> ScannedDevices;
+static constexpr size_t MAX_DISCOVERED_DEVICES = 64;
+static std::mutex s_devicesMutex;
+static std::vector<DeviceInfo> s_devices;
+
+bool addDiscoveredDevice(const DeviceInfo& device) {
+    // Discovery is best effort. Never block the UDP worker shared with Art-Net.
+    const std::unique_lock<std::mutex> lock(s_devicesMutex, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
+    if (s_devices.size() >= MAX_DISCOVERED_DEVICES) return false;
+    for (const auto& existing : s_devices) {
+        if (existing.mac == device.mac) return false;
+    }
+    s_devices.push_back(device);
+    return true;
+}
 
 static bool     s_running             = false;
 static uint32_t s_startMs             = 0;
@@ -27,7 +42,10 @@ static inline uint32_t nowMs() {
 }
 
 void clearDevices() {
-    ScannedDevices.clear();
+    {
+        const std::lock_guard<std::mutex> lock(s_devicesMutex);
+        s_devices.clear();
+    }
     resetUDPDiscoveryListener();
 }
 
@@ -35,8 +53,9 @@ bool isDiscoveryRunning() {
     return s_running;
 }
 
-const std::vector<DeviceInfo>& getDiscoveredUDPDevices() {
-    return ScannedDevices;
+std::vector<DeviceInfo> getDiscoveredUDPDevices() {
+    const std::lock_guard<std::mutex> lock(s_devicesMutex);
+    return s_devices;
 }
 
 void startCombinedDiscovery(bool withESPNow) {
@@ -116,14 +135,15 @@ void updateCombinedDiscovery() {
             s_wifiReconnectNeeded = false;
             resumeWiFiSTA();
         }
-        ESP_LOGI(TAG, "Scan complete — %d device(s)", (int)ScannedDevices.size());
+        ESP_LOGI(TAG, "Scan complete");
         printDiscoveredDevices();
     }
 }
 
 void printDiscoveredDevices() {
-    ESP_LOGI(TAG, "Found %d device(s):", (int)ScannedDevices.size());
-    for (const auto& d : ScannedDevices) {
+    const auto devices = getDiscoveredUDPDevices();
+    ESP_LOGI(TAG, "Found %d device(s):", (int)devices.size());
+    for (const auto& d : devices) {
         ESP_LOGI(TAG, "  %s @ %s [%s] fw:%s temp:%.1f up:%lum",
                  d.id.c_str(), d.ip.c_str(), d.mode.c_str(),
                  d.fw.c_str(), d.temp, (unsigned long)d.uptime);

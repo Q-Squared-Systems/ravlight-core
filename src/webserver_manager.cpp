@@ -1,12 +1,16 @@
 #include "webserver_manager.h"
 #include "config.h"
 #include "fixture_config.h"
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+#include "fixtures/orion/fixture.h"
+#endif
 #include <LittleFS.h>
 #include "network_manager.h"
 #include <Update.h>
 #include "runtime.h"
 #include <ArduinoJson.h>
-#include <AsyncJson.h>
+#include <cstdlib>
+#include <cstring>
 #include <Ticker.h>
 #include "dmx_manager.h"
 #include "core/stats.h"
@@ -16,6 +20,7 @@
 #include <memory>
 #include <WiFi.h>
 #include <esp_timer.h>
+#include <esp_system.h>
 
 #ifdef RAVLIGHT_MODULE_EFFECTS
 #include "effects.h"
@@ -67,6 +72,74 @@ AsyncWebServer& getInstance() {
     return server;
 }
 
+
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+static bool rejectConfigDuringGravityReturn(AsyncWebServerRequest* request) {
+    if (!orionGravityReturnInProgress()) return false;
+    request->send(409, "text/plain", "Configuration is locked while the motor returns home");
+    return true;
+}
+#endif
+
+// The request owns _tempObject and frees it on completion or disconnect.
+static constexpr size_t MAX_CONFIG_BODY = 16384;
+
+struct ConfigBody {
+    size_t received;
+    size_t length;
+};
+
+static void collectConfigBody(AsyncWebServerRequest* request, uint8_t* data,
+                              size_t len, size_t index, size_t total) {
+    if (total == 0 || total > MAX_CONFIG_BODY) return;
+    auto* body = static_cast<ConfigBody*>(request->_tempObject);
+    if (index > total || len > total - index || (body && (body->received != index || body->length != total))) {
+        // Invalidate any earlier chunks so an incomplete request cannot apply.
+        free(body);
+        request->_tempObject = nullptr;
+        return;
+    }
+    if (!body) {
+        if (index != 0) return;
+        body = static_cast<ConfigBody*>(malloc(sizeof(ConfigBody) + total));
+        if (!body) return;
+        body->length = total;
+        request->_tempObject = body;
+    }
+    memcpy(reinterpret_cast<char*>(body + 1) + index, data, len);
+    body->received = index + len;
+}
+
+static bool parseConfigBody(AsyncWebServerRequest* request, DynamicJsonDocument& doc) {
+    const size_t length = request->contentLength();
+    if (length > MAX_CONFIG_BODY) {
+        request->send(413, "text/plain", "Configuration body too large");
+        return false;
+    }
+    const auto* body = static_cast<const ConfigBody*>(request->_tempObject);
+    if (!body || length == 0 || body->length != length || body->received != length ||
+        deserializeJson(doc, reinterpret_cast<const char*>(body + 1), length) || !doc.is<JsonObject>()) {
+        request->send(400, "text/plain", "Invalid configuration JSON");
+        return false;
+    }
+    return true;
+}
+
+static const char* resetReasonName(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON:   return "power_on";
+        case ESP_RST_EXT:       return "external";
+        case ESP_RST_SW:        return "software";
+        case ESP_RST_PANIC:     return "panic";
+        case ESP_RST_INT_WDT:   return "interrupt_watchdog";
+        case ESP_RST_TASK_WDT:  return "task_watchdog";
+        case ESP_RST_WDT:       return "watchdog";
+        case ESP_RST_DEEPSLEEP: return "deep_sleep";
+        case ESP_RST_BROWNOUT:  return "brownout";
+        case ESP_RST_SDIO:      return "sdio";
+        default:               return "unknown";
+    }
+}
 
 // Serve a text asset preferring its pre-gzipped sibling when present. The
 // scripts/gzip_assets.py pre-build hook produces <path>.gz next to each
@@ -221,6 +294,9 @@ void initWebServer() {
     // Applies live params immediately; restarts only if network/ID params changed.
     // Response: JSON {"restart": bool, "newIp": "x.x.x.x"}
     server.on("/save", HTTP_POST, [](AsyncWebServerRequest *request) {
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+        if (rejectConfigDuringGravityReturn(request)) return;
+#endif
         bool needsRestart = false;
         String newIp = netConfig.currentip;
 
@@ -370,19 +446,18 @@ void initWebServer() {
     // --- Config upload/download (shared) ---
     // Upload: parse JSON directly into in-memory structs → save to NVS → restart
     server.on("/upload_config", HTTP_POST,
-        [](AsyncWebServerRequest *request) {},
-        NULL,
-        [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+        [](AsyncWebServerRequest *request) {
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+            if (rejectConfigDuringGravityReturn(request)) return;
+#endif
             DynamicJsonDocument doc(4096);
-            if (deserializeJson(doc, (char*)data, len)) {
-                request->send(400, "text/plain", "JSON parse error");
-                return;
-            }
+            if (!parseConfigBody(request, doc)) return;
             applyConfigJson(doc);
             saveConfig();
             request->send(200, "text/plain", "OK");
             scheduleRestart();
-        }
+        },
+        nullptr, collectConfigBody
     );
 
     // Download: serialize from in-memory structs (always up-to-date with NVS)
@@ -506,7 +581,7 @@ void initWebServer() {
         request->send(200, "text/plain", oledDiag());
     });
     server.on("/api/status", HTTP_GET, [](AsyncWebServerRequest *request) {
-        DynamicJsonDocument doc(768);
+        DynamicJsonDocument doc(1024);
         doc["fw"]            = FW_VERSION;
         doc["board"]         = BOARD_NAME;
         // OTA feed key of this build. BOARD_NAME is a display label and cannot
@@ -519,8 +594,13 @@ void initWebServer() {
         doc["cfg_hash"]      = configHash();
         doc["project"]       = PROJECT_NAME;
         doc["id"]            = setConfig.ID_fixture;
-        doc["mode"]          = getConnectionMode();
+        const char* mode     = getConnectionMode();
+        doc["mode"]          = mode;
         doc["ip"]            = netConfig.currentip;
+#ifdef RAVLIGHT_MODULE_ETHERNET
+        if (strcmp(mode, "ETH") == 0) doc["mac"] = ETH.macAddress();
+        else
+#endif
         doc["mac"]           = WiFi.macAddress();
         doc["mdns"]          = "rav" + setConfig.ID_fixture + ".local";
         // RSSI only meaningful on WiFi STA — ETH and SoftAP just emit 0.
@@ -530,6 +610,9 @@ void initWebServer() {
         // boot — divide by 1e6) — independent of the per-minute counter
         // that runtime.cpp persists to NVS.
         doc["uptime_sec"]    = (uint32_t)(esp_timer_get_time() / 1000000ULL);
+        const esp_reset_reason_t reason = esp_reset_reason();
+        doc["reset_reason"] = resetReasonName(reason);
+        doc["reset_reason_code"] = static_cast<int>(reason);
         // Total operating hours across all boots. currentRuntime/
         // totalRuntime in runtime.cpp are incremented once per minute
         // (despite the legacy "total_hours" NVS key name), so divide by
@@ -548,7 +631,11 @@ void initWebServer() {
         doc["runtime"]       = currentRuntime;
         doc["total_runtime"] = totalRuntime;
         String out;
-        serializeJson(doc, out);
+        const size_t length = measureJson(doc);
+        if (doc.overflowed() || !out.reserve(length) || serializeJson(doc, out) != length) {
+            request->send(503, "text/plain", "Status temporarily unavailable");
+            return;
+        }
         request->send(200, "application/json", out);
     });
 
@@ -772,17 +859,17 @@ x.send(fd);}</script></body></html>)HTML";
     // before commit; returns {ok, restart_needed} so the client can decide whether
     // to POST /restart afterwards. Existing form-based /save endpoint remains for
     // backward compatibility while the SPA is rolled in.
-    // The default DYNAMIC_JSON_DOCUMENT_SIZE (1024) isn't enough for the full
-    // config blob — fixture sections (Elyon/Orion with N LED outputs) can push
-    // raw JSON past 1 KB, and ArduinoJson needs 2-3× that for node storage.
-    AsyncCallbackJsonWebHandler* postConfig = new AsyncCallbackJsonWebHandler(
-        "/api/config",
-        [](AsyncWebServerRequest *request, JsonVariant &body) {
-            if (!body.is<JsonObject>()) {
-                request->send(400, "application/json",
-                              "{\"ok\":false,\"error\":\"invalid json\"}");
+    server.on("/api/config", HTTP_POST,
+        [](AsyncWebServerRequest *request) {
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+            if (rejectConfigDuringGravityReturn(request)) return;
+#endif
+            if (!request->contentType().equalsIgnoreCase("application/json")) {
+                request->send(415, "text/plain", "Expected application/json");
                 return;
             }
+            DynamicJsonDocument body(4096);
+            if (!parseConfigBody(request, body)) return;
             JsonObject doc = body.as<JsonObject>();
             bool restartNeeded = false;
             String restartReason;
@@ -938,8 +1025,7 @@ x.send(fd);}</script></body></html>)HTML";
             serializeJson(resp, out);
             request->send(200, "application/json", out);
         },
-        4096);  // maxJsonBufferSize — full config blob can exceed 1 KB
-    server.addHandler(postConfig);
+        nullptr, collectConfigBody);
 
     registerFixtureRoutes(server);
 
@@ -975,9 +1061,9 @@ x.send(fd);}</script></body></html>)HTML";
 #endif
     });
 
-    // Return current ScannedDevices as JSON array
+    // Serialize a snapshot without holding the discovery lock.
     server.on("/devices", HTTP_GET, [](AsyncWebServerRequest *request) {
-        const auto& devices = getDiscoveredUDPDevices();
+        const auto devices = getDiscoveredUDPDevices();
         DynamicJsonDocument doc(2048);
         JsonArray arr = doc.to<JsonArray>();
         for (const auto& d : devices) {
@@ -1057,13 +1143,20 @@ x.send(fd);}</script></body></html>)HTML";
         if (req->hasParam("universe")) universe = (uint16_t)req->getParam("universe")->value().toInt();
 
         uint8_t local[513] = {0};
-        xSemaphoreTake(dmxBufferMutex, portMAX_DELAY);
+        // Monitoring is best effort. Let the next poll retry if DMX owns the lock.
+        if (!dmxBufferMutex || xSemaphoreTake(dmxBufferMutex, 0) != pdTRUE) {
+            req->send(503, "text/plain", "DMX data temporarily unavailable");
+            return;
+        }
         const uint8_t* buf = getUniverseData(universe);
         if (buf) memcpy(local + 1, buf + 1, 512);
         xSemaphoreGive(dmxBufferMutex);
 
         String out;
-        out.reserve(2560);
+        if (!out.reserve(2049)) {
+            req->send(503, "text/plain", "DMX data temporarily unavailable");
+            return;
+        }
         out += '[';
         for (int i = 1; i <= 512; i++) {
             out += local[i];

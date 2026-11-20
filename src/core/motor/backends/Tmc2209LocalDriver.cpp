@@ -140,6 +140,10 @@ bool Tmc2209LocalDriver::begin() {
     // DIAG interrupt — RISING edge when TMC2209 detects stall
     attachInterruptArg(digitalPinToInterrupt(_diag_pin), _diagIsrCb, this, RISING);
 
+#ifdef RAVLIGHT_TMC_STEALTHCHOP_TRIAL
+    // Apply to both cold starts and retained starts while STEP is idle.
+    _configureStealthChopTrial();
+#endif
     _setDriverEnabled(true);
     _state       = MotorState::IDLE;
     _fault_flags = 0;
@@ -164,7 +168,9 @@ void Tmc2209LocalDriver::_configureTmc() {
     // SpreadCycle from boot — silent on this motor in motion AND at idle.
     // The StealthChop hum is motor-specific and we never reach a silent
     // chopper state with it on this hardware.
+#ifndef RAVLIGHT_TMC_STEALTHCHOP_TRIAL
     _tmc->en_spreadCycle(true);
+#endif
     // SGTHRS = 0 means DIAG never fires from stall comparison — set higher
     // only when entering homing/SGCal. Prevents spurious stall faults on jog.
     _tmc->SGTHRS(0);
@@ -194,6 +200,124 @@ void Tmc2209LocalDriver::_configureTmc() {
     _tmc->sedn(0b01);
     _tmc->seimin(1);
 }
+
+#if defined(RAVLIGHT_TMC_STEALTHCHOP_TRIAL) || defined(HW_MOTOR_PASSIVE_BRAKE_TEST)
+// GCONF writes take the raw setting. Readback exposes the effective value
+// after the SPREAD pin inverts bit 2, so the conversion works both ways.
+static constexpr uint32_t invertGconfSpreadBit(uint32_t gconf, bool spreadPinHigh) {
+    return gconf ^ (spreadPinHigh ? (1u << 2) : 0u);
+}
+
+static_assert(invertGconfSpreadBit(0x1C1, true) == 0x1C5, "Restore StealthChop with SPREAD high");
+static_assert(invertGconfSpreadBit(0x1C5, true) == 0x1C1, "Restore SpreadCycle with SPREAD high");
+static_assert(invertGconfSpreadBit(0x1C1, false) == 0x1C1, "Preserve GCONF with SPREAD low");
+#endif
+
+#ifdef RAVLIGHT_TMC_STEALTHCHOP_TRIAL
+void Tmc2209LocalDriver::_configureStealthChopTrial() {
+#ifdef RAVLIGHT_TMC_RECOVERY_DIAGNOSTICS
+    ProfileTrace trace;
+    trace.attempts = 1;
+    trace.expectedWrites = 5;
+    const auto recordFailure = [&](const char* reason) {
+        trace.result = reason;
+        trace.readback = _captureProfileRegisters();
+        _recordProfileTrace(false, trace);
+    };
+#endif
+
+    TMC2209_n::IOIN_t pins{};
+    pins.sr = _tmc->IOIN();
+    if (_tmc->CRCerror) {
+#ifdef RAVLIGHT_TMC_RECOVERY_DIAGNOSTICS
+        recordFailure("ioin_read_failed");
+#endif
+        return;
+    }
+
+    TMC2208_n::GCONF_t gconf{};
+    gconf.sr = _tmc->GCONF();
+    if (_tmc->CRCerror) {
+#ifdef RAVLIGHT_TMC_RECOVERY_DIAGNOSTICS
+        recordFailure("gconf_read_failed");
+#endif
+        return;
+    }
+
+    TMC2208_n::PWMCONF_t pwmconf{};
+    pwmconf.sr = _tmc->PWMCONF();
+    if (_tmc->CRCerror) {
+#ifdef RAVLIGHT_TMC_RECOVERY_DIAGNOSTICS
+        recordFailure("pwmconf_read_failed");
+#endif
+        return;
+    }
+
+#ifdef RAVLIGHT_TMC_COOLSTEP_TRIAL
+    const uint8_t initialWriteCount = _tmc->IFCNT();
+    if (_tmc->CRCerror) {
+#ifdef RAVLIGHT_TMC_RECOVERY_DIAGNOSTICS
+        trace.ifcntBefore = {initialWriteCount, false};
+        recordFailure("ifcnt_before_read_failed");
+#endif
+        return;
+    }
+
+    // TSTEP counts clock ticks at the equivalent 1/256 microstep rate.
+    // 250 ticks is nominally 3,000 input steps/s at 1/16 and a 12 MHz clock.
+    _tmc->TCOOLTHRS(250);
+    TMC2209_n::COOLCONF_t coolconf{};
+    coolconf.semin = 10; // Restore current below SG_RESULT 320.
+    coolconf.semax = 2;  // Reduce current only above SG_RESULT 416.
+    coolconf.seup = 3;   // Raise the current scale by eight per increment.
+    coolconf.sedn = 0;   // Wait 32 measurements per decrement.
+    coolconf.seimin = 0; // Select the half-IRUN scale floor.
+    _tmc->COOLCONF(coolconf.sr);
+#else
+    // Keep current fixed in the StealthChop comparison build.
+    _tmc->semin(0);
+#endif
+    _tmc->TPWMTHRS(0); // No automatic switch to SpreadCycle at speed.
+    pwmconf.pwm_autoscale = true;
+    pwmconf.pwm_autograd = true;
+    _tmc->PWMCONF(pwmconf.sr);
+    gconf.en_spreadcycle = pins.spread_en; // The SPREAD pin XORs this bit.
+    _tmc->GCONF(gconf.sr);
+#ifdef RAVLIGHT_TMC_COOLSTEP_TRIAL
+    const uint8_t finalWriteCount = _tmc->IFCNT();
+    const bool counterValid = !_tmc->CRCerror;
+    _coolStepConfigured.store(counterValid && finalWriteCount == static_cast<uint8_t>(initialWriteCount + 5),
+                              std::memory_order_relaxed);
+#ifdef RAVLIGHT_TMC_RECOVERY_DIAGNOSTICS
+    trace.targetKnown = true;
+    trace.targetGconf = gconf.sr;
+    trace.expectedEffectiveGconf = invertGconfSpreadBit(gconf.sr, pins.spread_en);
+    trace.targetPwmconf = pwmconf.sr;
+    trace.ifcntBefore = {initialWriteCount, true};
+    trace.ifcntAfter = {finalWriteCount, counterValid};
+    trace.result = !counterValid ? "ifcnt_after_read_failed" :
+                   coolStepConfigured() ? "writes_acknowledged" : "ifcnt_delta_mismatch";
+    trace.readback = _captureProfileRegisters();
+    if (coolStepConfigured()) {
+        if (!trace.readback.gconf.valid) trace.result = "gconf_readback_failed";
+        else if (trace.readback.gconf.value != trace.expectedEffectiveGconf) trace.result = "gconf_mismatch";
+        else if (!trace.readback.pwmconf.valid) trace.result = "pwmconf_readback_failed";
+        else if (trace.readback.pwmconf.value != trace.targetPwmconf) trace.result = "pwmconf_mismatch";
+        else trace.result = "register_checks_passed";
+    }
+    _recordProfileTrace(false, trace);
+#endif
+#endif
+}
+
+const char* Tmc2209LocalDriver::chopperModeAtIdle() const {
+    switch (_idleChopperMode.load(std::memory_order_relaxed)) {
+        case ChopperMode::STEALTH_CHOP: return "StealthChop";
+        case ChopperMode::SPREAD_CYCLE: return "SpreadCycle";
+        default: return "unknown";
+    }
+}
+#endif
 
 void Tmc2209LocalDriver::_setDriverEnabled(bool enabled) {
     digitalWrite(_en_pin, enabled ? EN_ENABLE : EN_DISABLE);
@@ -539,14 +663,51 @@ void Tmc2209LocalDriver::setHoldCurrent(uint16_t ma) {
 static constexpr uint32_t BRAKE_RAMP_MS = 2000;
 static constexpr uint32_t BRAKE_DWELL_MS = 3000;
 
-bool Tmc2209LocalDriver::beginPassiveBrakeTest() {
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+bool Tmc2209LocalDriver::verifyRecoveryDriver() {
+    TMC2209_n::IOIN_t pins{};
+    pins.sr = _tmc->IOIN();
+    if (_tmc->CRCerror || pins.version != 0x21 || pins.enn) return false;
+    GSTAT_t general{};
+    general.sr = _tmc->GSTAT();
+    if (_tmc->CRCerror || general.reset || general.drv_err || general.uv_cp) return false;
+    TMC2208_n::DRV_STATUS_t status{};
+    status.sr = _tmc->DRV_STATUS();
+    return !_tmc->CRCerror && !status.ot && !status.otpw &&
+           !status.s2ga && !status.s2gb && !status.s2vsa && !status.s2vsb;
+}
+#endif
+
+bool Tmc2209LocalDriver::beginPassiveBrakeTest(bool recovery) {
     if (!_tmc || !_stepper || _state != MotorState::IDLE || isBusy() ||
-        _fault_flags || !_tmc->ihold()) return false;
+        _fault_flags) return false;
+
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+    if (recovery) {
+        if (!verifyRecoveryDriver() || !_run_ma || !_hold_ma) return false;
+        // The near-instant fault stop may have left emergency acceleration
+        // active while the recovery task was waiting for STEP to go idle.
+        if (_accel_override_active) {
+            _stepper->setAcceleration(_saved_accel);
+            _accel_override_active = false;
+        }
+        // A retained boot does not initialize TMCStepper's write-only current
+        // shadow. Apply known saved currents before using that shadow to restore hold.
+        const uint8_t before = _tmc->IFCNT();
+        if (_tmc->CRCerror) return false;
+        setRunCurrent(_run_ma);
+        if (_tmc->IFCNT() != static_cast<uint8_t>(before + 3) || _tmc->CRCerror)
+            return false;
+    }
+#endif
+    if (!_tmc->ihold()) return false;
+    _brake_for_recovery = recovery;
 
     TMC2209_n::IOIN_t pins{};
     pins.sr = _tmc->IOIN();
     if (_tmc->CRCerror || pins.version != 0x21 || pins.enn) return false;
 
+    _brake_spread_pin_high = pins.spread_en;
     _brake_saved_gconf = _tmc->GCONF();
     if (_tmc->CRCerror) return false;
     _brake_saved_pwmconf = _tmc->PWMCONF();
@@ -575,39 +736,95 @@ bool Tmc2209LocalDriver::beginPassiveBrakeTest() {
     return true;
 }
 
-bool Tmc2209LocalDriver::updatePassiveBrakeTest() {
+Tmc2209LocalDriver::BrakeProgress Tmc2209LocalDriver::updatePassiveBrakeTest() {
+    const uint32_t rampMs = _brake_for_recovery ? 4000 : BRAKE_RAMP_MS;
+    const uint32_t dwellMs = _brake_for_recovery ? 14000 : BRAKE_DWELL_MS;
     const uint32_t elapsed = millis() - _brake_test_start_ms;
-    if (elapsed >= BRAKE_RAMP_MS + BRAKE_DWELL_MS) return false;
-    const uint8_t initial_hold = _brake_saved_currents & 0x1Fu;
-    const uint8_t hold = elapsed >= BRAKE_RAMP_MS ? 0 :
-        initial_hold - elapsed * initial_hold / BRAKE_RAMP_MS;
+    const uint8_t initialHold = _brake_saved_currents & 0x1Fu;
+    const uint8_t hold = elapsed >= rampMs ? 0 :
+        initialHold - elapsed * initialHold / rampMs;
     if (hold != _tmc->ihold()) {
         const uint8_t before = _tmc->IFCNT();
-        if (_tmc->CRCerror) return false;
+        if (_tmc->CRCerror) return BrakeProgress::FAILED;
         _tmc->ihold(hold);
         if (_tmc->IFCNT() != static_cast<uint8_t>(before + 1) || _tmc->CRCerror)
-            return false;
+            return BrakeProgress::FAILED;
+        if (!hold) _brake_test_start_ms = millis() - rampMs; // Dwell starts at verified zero.
+        return BrakeProgress::RUNNING;
     }
-    return true;
+    return elapsed >= rampMs + dwellMs ? BrakeProgress::COMPLETE : BrakeProgress::RUNNING;
 }
 
 bool Tmc2209LocalDriver::endPassiveBrakeTest() {
-    // Restore current before changing chopper mode. Reapply all three
-    // registers on a UART error while leaving step generation idle.
+    const uint32_t gconfToWrite = invertGconfSpreadBit(_brake_saved_gconf, _brake_spread_pin_high);
+
+#ifdef RAVLIGHT_TMC_RECOVERY_DIAGNOSTICS
+    ProfileTrace trace;
+    trace.expectedWrites = 3;
+    trace.targetKnown = true;
+    trace.targetGconf = gconfToWrite;
+    trace.expectedEffectiveGconf = _brake_saved_gconf;
+    trace.targetPwmconf = _brake_saved_pwmconf;
+    trace.targetCurrents = _brake_saved_currents;
+#endif
+
+    // Keep the pio8.5 write sequence and acknowledgement criterion.
+    // Only the representation of the saved mode bit changes.
     for (int attempt = 0; attempt < 3; ++attempt) {
         const uint8_t before = _tmc->IFCNT();
-        const bool counter_valid = !_tmc->CRCerror;
+        const bool beforeValid = !_tmc->CRCerror;
         _tmc->IHOLD_IRUN(_brake_saved_currents);
         _tmc->PWMCONF(_brake_saved_pwmconf);
-        _tmc->GCONF(_brake_saved_gconf);
-        if (_tmc->IFCNT() == static_cast<uint8_t>(before + 3) &&
-            counter_valid && !_tmc->CRCerror) return true;
+        _tmc->GCONF(gconfToWrite);
+        const uint8_t after = _tmc->IFCNT();
+        const bool afterValid = !_tmc->CRCerror;
+        const bool restoreOk = beforeValid && afterValid &&
+                               after == static_cast<uint8_t>(before + 3);
+#ifdef RAVLIGHT_TMC_RECOVERY_DIAGNOSTICS
+        trace.attempts = attempt + 1;
+        trace.ifcntBefore = {before, beforeValid};
+        trace.ifcntAfter = {after, afterValid};
+        trace.result = !beforeValid ? "ifcnt_before_read_failed" :
+                       !afterValid ? "ifcnt_after_read_failed" :
+                       restoreOk ? "writes_acknowledged" : "ifcnt_delta_mismatch";
+        if (_brake_for_recovery && (restoreOk || attempt == 2)) {
+            trace.readback = _captureProfileRegisters();
+            _recordProfileTrace(true, trace);
+        }
+#endif
+        if (restoreOk) return true;
     }
     _homed = false;
     _state = MotorState::FAULT;
     _fault_flags |= static_cast<uint8_t>(MotorFault::DRIVER_ERROR);
     ESP_LOGE(TAG, "Unable to verify holding-current restore after passive brake test");
     return false;
+}
+#endif
+
+#ifdef RAVLIGHT_TMC_RECOVERY_DIAGNOSTICS
+Tmc2209LocalDriver::RegisterSnapshot Tmc2209LocalDriver::_captureProfileRegisters() {
+    RegisterSnapshot snapshot;
+    snapshot.uptimeMs = millis();
+    snapshot.gconf = {_tmc->GCONF(), !_tmc->CRCerror};
+    snapshot.pwmconf = {_tmc->PWMCONF(), !_tmc->CRCerror};
+    snapshot.ioin = {_tmc->IOIN(), !_tmc->CRCerror};
+    snapshot.drvStatus = {_tmc->DRV_STATUS(), !_tmc->CRCerror};
+    snapshot.tstep = {_tmc->TSTEP(), !_tmc->CRCerror};
+    return snapshot;
+}
+
+void Tmc2209LocalDriver::_recordProfileTrace(bool recovery, const ProfileTrace& trace) {
+    portENTER_CRITICAL(&_profileMux);
+    (recovery ? _profileDiagnostics.recoveryRestore : _profileDiagnostics.bootProfile) = trace;
+    portEXIT_CRITICAL(&_profileMux);
+}
+
+Tmc2209LocalDriver::ProfileDiagnostics Tmc2209LocalDriver::profileDiagnostics() {
+    portENTER_CRITICAL(&_profileMux);
+    const auto copy = _profileDiagnostics;
+    portEXIT_CRITICAL(&_profileMux);
+    return copy;
 }
 #endif
 
@@ -733,10 +950,7 @@ void Tmc2209LocalDriver::update() {
             // during the post-stop deceleration grace window.
             if (!_sg_cal && !_jog_ignore_stall && !in_grace
                 && abs(spd_mhz) >= STALL_MIN_SPD_MHZ) {
-                _instantStop();   // no ignore_commands trap
-                _fault_flags |= (uint8_t)MotorFault::STALL;
-                _state = MotorState::FAULT;
-                ESP_LOGW(TAG, "stall during jog (spd=%d mHz)", spd_mhz);
+                _stopOnOperationalDiag(spd_mhz);
             }
         }
         // Anticipated soft-limit deceleration. Two behaviours in one block:
@@ -838,10 +1052,7 @@ void Tmc2209LocalDriver::update() {
             bool in_grace = (int32_t)(_stop_grace_until_ms - millis()) > 0;
             if (!_sg_cal && !_jog_ignore_stall && !in_grace
                 && abs(spd_mhz) >= STALL_MIN_SPD_MHZ) {
-                _instantStop();   // no ignore_commands trap
-                _fault_flags |= (uint8_t)MotorFault::STALL;
-                _state = MotorState::FAULT;
-                ESP_LOGW(TAG, "stall detected via DIAG (spd=%d mHz)", spd_mhz);
+                _stopOnOperationalDiag(spd_mhz);
             }
         }
     }
@@ -1019,6 +1230,34 @@ void Tmc2209LocalDriver::_updateHoming() {
 
 // ─── Private helpers ─────────────────────────────────────────────────────────
 
+void Tmc2209LocalDriver::_stopOnOperationalDiag(int32_t speed_mhz) {
+    // DIAG can also indicate a driver fault. Keep the stop and holding
+    // torque even when operational StallGuard is disabled.
+    _instantStop();
+    _state = MotorState::FAULT;
+
+    GSTAT_t gstat{};
+    gstat.sr = _tmc->GSTAT();
+    const bool gstat_valid = !_tmc->CRCerror;
+    TMC2208_n::DRV_STATUS_t drv_status{};
+    drv_status.sr = _tmc->DRV_STATUS();
+    const bool drv_status_valid = !_tmc->CRCerror;
+    const bool driver_error =
+        (gstat_valid && (gstat.drv_err || gstat.uv_cp)) ||
+        (drv_status_valid && (drv_status.ot || drv_status.s2ga || drv_status.s2gb ||
+                              drv_status.s2vsa || drv_status.s2vsb));
+    if (_sgthrs_active == 0 || driver_error) {
+        _fault_flags |= static_cast<uint8_t>(MotorFault::DRIVER_ERROR);
+        if (_invalidate_home_on_stall) _homed = false;
+    } else {
+        _fault_flags |= static_cast<uint8_t>(MotorFault::STALL);
+    }
+    Serial.printf("[TMC2209] DIAG stop: speed=%ld mHz SGTHRS=%u GSTAT=0x%02x (%s) DRV_STATUS=0x%08lx (%s)\n",
+                  static_cast<long>(speed_mhz), static_cast<unsigned>(_sgthrs_active),
+                  static_cast<unsigned>(gstat.sr), gstat_valid ? "valid" : "CRC error",
+                  static_cast<unsigned long>(drv_status.sr), drv_status_valid ? "valid" : "CRC error");
+}
+
 void Tmc2209LocalDriver::_readRegisters() {
     _sg_result = _tmc->SG_RESULT();
 
@@ -1036,6 +1275,13 @@ void Tmc2209LocalDriver::_readRegisters() {
     if (millis() - _last_motion_ms < 500) {
         return;
     }
+
+#ifdef RAVLIGHT_TMC_STEALTHCHOP_TRIAL
+    const bool stealth = _tmc->stealth();
+    _idleChopperMode.store(_tmc->CRCerror ? ChopperMode::UNKNOWN :
+                          stealth ? ChopperMode::STEALTH_CHOP : ChopperMode::SPREAD_CYCLE,
+                          std::memory_order_relaxed);
+#endif
 
     // DRV_STATUS bit layout differs across TMC chips — use the library's
     // chip-specific accessors instead of raw bit math. The accessors include

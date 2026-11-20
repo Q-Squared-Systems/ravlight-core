@@ -1,5 +1,7 @@
 #pragma once
+#ifndef FW_VERSION
 #define FW_VERSION  "2.24.0"
+#endif
 
 // custom_fw_name of this build (e.g. "elyon_quinled_octa"), injected as a -D
 // flag by scripts/embed_assets.py. It is the OTA feed key and the only string

@@ -4,6 +4,12 @@
 #include <TMCStepper.h>
 #include <FastAccelStepper.h>
 #include <esp_timer.h>
+#ifdef RAVLIGHT_TMC_RECOVERY_DIAGNOSTICS
+#include <freertos/FreeRTOS.h>
+#endif
+#ifdef RAVLIGHT_TMC_STEALTHCHOP_TRIAL
+#include <atomic>
+#endif
 
 // Homing configuration — passed via setHomingConfig() before calling startHoming().
 struct HomingConfig {
@@ -64,13 +70,55 @@ public:
     void startHoming()     override;
     void setHomePosition() override;
     void setHomingConfig(const HomingConfig& cfg);
+#ifdef RAVLIGHT_TMC_STEALTHCHOP_TRIAL
+    const char* chopperModeAtIdle() const;
+#endif
+#ifdef RAVLIGHT_TMC_COOLSTEP_TRIAL
+    bool coolStepConfigured() const { return _coolStepConfigured.load(std::memory_order_relaxed); }
+#endif
+
+#ifdef RAVLIGHT_TMC_RECOVERY_DIAGNOSTICS
+    struct RegisterRead {
+        uint32_t value = 0;
+        bool valid = false;
+    };
+
+    struct RegisterSnapshot {
+        uint32_t uptimeMs = 0;
+        RegisterRead gconf, pwmconf, ioin, drvStatus, tstep;
+    };
+
+    struct ProfileTrace {
+        const char* result = "not_attempted";
+        uint8_t attempts = 0;
+        uint8_t expectedWrites = 0;
+        bool targetKnown = false;
+        uint32_t targetGconf = 0;
+        uint32_t expectedEffectiveGconf = 0;
+        uint32_t targetPwmconf = 0;
+        uint32_t targetCurrents = 0;
+        RegisterRead ifcntBefore, ifcntAfter;
+        RegisterSnapshot readback;
+    };
+
+    struct ProfileDiagnostics {
+        ProfileTrace bootProfile;
+        ProfileTrace recoveryRestore;
+    };
+
+    ProfileDiagnostics profileDiagnostics();
+#endif
 
     // Current control
     void setRunCurrent(uint16_t ma)  override;
     void setHoldCurrent(uint16_t ma) override;
 #ifdef HW_MOTOR_PASSIVE_BRAKE_TEST
-    bool beginPassiveBrakeTest();
-    bool updatePassiveBrakeTest();  // true while the timed test is running
+    enum class BrakeProgress : uint8_t { RUNNING, COMPLETE, FAILED };
+    bool beginPassiveBrakeTest(bool recovery = false);
+    BrakeProgress updatePassiveBrakeTest();
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+    bool verifyRecoveryDriver();
+#endif
     bool endPassiveBrakeTest();
 #endif
 
@@ -110,7 +158,9 @@ private:
     uint8_t    _driver_temp = 0;
 #ifdef HW_MOTOR_PASSIVE_BRAKE_TEST
     uint32_t _brake_test_start_ms = 0;
-    uint32_t _brake_saved_gconf = 0;
+    bool _brake_for_recovery = false;
+    uint32_t _brake_saved_gconf = 0; // Effective readback, including the SPREAD pin.
+    bool _brake_spread_pin_high = false;
     uint32_t _brake_saved_pwmconf = 0;
     uint32_t _brake_saved_currents = 0;
 #endif
@@ -215,8 +265,23 @@ private:
 
     static void IRAM_ATTR _diagIsrCb(void* arg);
     void _readRegisters();
+    void _stopOnOperationalDiag(int32_t speed_mhz);
     void _updateHoming();
     void _configureTmc();
+#ifdef RAVLIGHT_TMC_STEALTHCHOP_TRIAL
+    enum class ChopperMode : uint8_t { UNKNOWN, SPREAD_CYCLE, STEALTH_CHOP };
+    std::atomic<ChopperMode> _idleChopperMode{ChopperMode::UNKNOWN};
+    void _configureStealthChopTrial();
+#endif
+#ifdef RAVLIGHT_TMC_COOLSTEP_TRIAL
+    std::atomic<bool> _coolStepConfigured{false};
+#endif
+#ifdef RAVLIGHT_TMC_RECOVERY_DIAGNOSTICS
+    portMUX_TYPE _profileMux = portMUX_INITIALIZER_UNLOCKED;
+    ProfileDiagnostics _profileDiagnostics;
+    RegisterSnapshot _captureProfileRegisters();
+    void _recordProfileTrace(bool recovery, const ProfileTrace& trace);
+#endif
     void _setDriverEnabled(bool enabled);
 
 #ifdef HW_MOTOR_RETAIN_ENABLE

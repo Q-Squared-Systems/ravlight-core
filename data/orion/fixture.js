@@ -1073,8 +1073,9 @@
         // Skipped while the operator is actively dragging the load block —
         // orionDragMove() already drives ovLoad/ovCable optimistically, and a
         // stale poll sample landing mid-drag would fight the pointer.
+        let oob = false;
         if (!_dragging) {
-            let f = 0, oob = false;
+            let f = 0;
             if (s && s.positionCm != null) {
                 const travelCm = displayToCm(String(travel)) || 0;
                 f = travelCm > 0 ? Math.abs(s.positionCm) / travelCm : 0;

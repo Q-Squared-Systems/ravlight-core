@@ -101,7 +101,7 @@ def rename_bin(source, target, env):
     proj_dir  = env.subst("$PROJECT_DIR")
     build_dir = env.subst("$BUILD_DIR")
     src       = str(target[0])
-    version   = get_fw_version(proj_dir)
+    version   = env.GetProjectOption("custom_fw_version", "") or get_fw_version(proj_dir)
     is_fs     = "littlefs" in os.path.basename(src)
 
     try:

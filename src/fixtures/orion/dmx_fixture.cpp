@@ -12,9 +12,7 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <esp_log.h>
-#ifdef HW_MOTOR_PASSIVE_BRAKE_TEST
 #include <atomic>
-#endif
 
 static const char* TAG = "ORION";
 
@@ -59,7 +57,7 @@ static bool     g_manual_override  = false;
 // task (core 1) at the top of each cycle — avoids concurrent UART access and
 // driver state mutations from two cores at the same time.
 // Bits: bit 0 = clear fault (+ maybe home), bit 1 = apply motor currents.
-static volatile uint8_t g_motor_cmd = 0;
+static std::atomic<uint8_t> g_motor_cmd{0};
 #define MOTOR_CMD_CLEAR_FAULT    0x01u
 #define MOTOR_CMD_APPLY_CURRENTS 0x02u
 
@@ -518,15 +516,171 @@ static void updateSgSweep() {
 
 // ── Motor update task — pinned to core 1, high priority ─────────────────────
 
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+enum class GravityRecovery : uint8_t {
+    IDLE, STOPPING, RETURNING, WAIT_FRAME, RESUMING, ABORT, FAILED
+};
+static std::atomic<GravityRecovery> g_recovery{GravityRecovery::IDLE};
+static std::atomic<uint32_t> g_recovery_frame_cutoff{0};
+static std::atomic<int32_t> g_recovery_resume_target{0};
+static std::atomic<const char*> g_recovery_failure{nullptr};
+
+const char* orionGravityRecoveryFailure() {
+    return g_recovery_failure.load();
+}
+
+bool orionGravityReturnInProgress() {
+    const auto state = g_recovery.load();
+    return state == GravityRecovery::STOPPING || state == GravityRecovery::RETURNING ||
+           state == GravityRecovery::ABORT;
+}
+
+const char* orionGravityRecoveryStatus() {
+    switch (g_recovery.load()) {
+        case GravityRecovery::STOPPING:   return "stopping";
+        case GravityRecovery::RETURNING:  return "returning_home";
+        case GravityRecovery::WAIT_FRAME: return "waiting_for_dmx";
+        case GravityRecovery::RESUMING:   return "resuming";
+        case GravityRecovery::ABORT:      return "stopping";
+        case GravityRecovery::FAILED:     return "failed_latched";
+        default:                          return "idle";
+    }
+}
+
+static bool validGravityTravel() {
+    // Home is the crossover. Exactly one endpoint must be zero.
+    return (orionConfig.downPosition == 0) != (orionConfig.upPosition == 0);
+}
+
+static bool recoveryFrameCanResume(uint32_t frame, uint32_t cutoff, uint32_t now) {
+    return frame && static_cast<int32_t>(frame - cutoff) > 0 &&
+           now - frame <= ORION_DMX_WATCHDOG_MS;
+}
+
+static bool requestGravityRecovery() {
+    auto state = GravityRecovery::IDLE;
+    if (!g_recovery.compare_exchange_strong(state, GravityRecovery::STOPPING)) return false;
+    g_motor_cmd.fetch_and(static_cast<uint8_t>(~MOTOR_CMD_CLEAR_FAULT));
+    return true;
+}
+
+// Only the motor task runs the release and writes driver registers.
+static bool serviceGravityRecovery() {
+    using Progress = Tmc2209LocalDriver::BrakeProgress;
+    using Recovery = GravityRecovery;
+    static bool braking = false;
+    static uint32_t stopStarted = 0;
+    static uint32_t settledSince = 0;
+    static uint32_t resumeIdleSince = 0;
+    const auto state = g_recovery.load();
+    const auto motor = g_tmc->getStatus();
+    const uint32_t now = millis();
+    constexpr uint8_t stall = static_cast<uint8_t>(MotorFault::STALL);
+
+    if (state == Recovery::IDLE) {
+        if (motor.state == MotorState::FAULT && motor.fault_flags == stall &&
+            orionConfig.autoRehomeOnStall && orionConfig.dropAndRehome &&
+            !orionConfig.keepHomeOnStall && !g_manual_override) {
+            requestGravityRecovery();
+            return true;
+        }
+        return false;
+    }
+    if (state == Recovery::FAILED) return true;
+
+    if (state == Recovery::WAIT_FRAME || state == Recovery::RESUMING) {
+        if (motor.state == MotorState::FAULT || motor.fault_flags || !motor.homed) {
+            g_tmc->estop();
+            g_recovery_failure.store(state == Recovery::RESUMING ?
+                                     "fault_during_resumed_move" : "fault_before_resume");
+            g_recovery.store(Recovery::FAILED);
+            return true;
+        }
+        if (state == Recovery::RESUMING) {
+            if (motor.state == MotorState::IDLE && !g_tmc->isBusy() &&
+                motor.position == g_recovery_resume_target.load()) {
+                if (!resumeIdleSince) resumeIdleSince = now;
+                if (now - resumeIdleSince >= 1000) {
+                    auto expected = Recovery::RESUMING;
+                    g_recovery.compare_exchange_strong(expected, Recovery::IDLE);
+                }
+            } else {
+                resumeIdleSince = 0;
+            }
+        } else {
+            resumeIdleSince = 0;
+        }
+        return false;
+    }
+
+    const char* failure = "aborted";
+    if (state == Recovery::STOPPING) {
+        failure = "could_not_start_braked_return";
+        if (!stopStarted) stopStarted = now;
+        if (validGravityTravel() && now - stopStarted < 3000) {
+            if (g_tmc->isBusy() || motor.speed != 0) {
+                settledSince = 0;
+                return true;
+            }
+            if (!settledSince) settledSince = now;
+            if (now - settledSince < 500) return true;
+
+            if ((motor.state == MotorState::IDLE && !motor.fault_flags) ||
+                (motor.state == MotorState::FAULT && motor.fault_flags == stall &&
+                 g_tmc->verifyRecoveryDriver() && g_tmc->clearFault())) {
+                braking = g_tmc->beginPassiveBrakeTest(true);
+            }
+            stopStarted = settledSince = 0;
+            if (braking) {
+                auto expected = Recovery::STOPPING;
+                g_recovery.compare_exchange_strong(expected, Recovery::RETURNING);
+                return true;
+            }
+        }
+    } else if (state == Recovery::RETURNING) {
+        const auto progress = g_tmc->updatePassiveBrakeTest();
+        if (progress == Progress::RUNNING) return true;
+
+        const bool restored = g_tmc->endPassiveBrakeTest();
+        braking = false;
+        if (!restored) failure = "hold_restore_failed";
+        else if (progress == Progress::FAILED) failure = "brake_ramp_failed";
+        else if (g_recovery.load() == Recovery::RETURNING) failure = "post_return_check_failed";
+        if (progress == Progress::COMPLETE && restored && validGravityTravel() &&
+            g_tmc->verifyRecoveryDriver() && g_recovery.load() == Recovery::RETURNING) {
+            g_tmc->setHomePosition();
+            g_homing_done_ms = millis();
+            g_recovery_frame_cutoff.store(g_homing_done_ms);
+            auto expected = Recovery::RETURNING;
+            if (g_recovery.compare_exchange_strong(expected, Recovery::WAIT_FRAME))
+                return true;
+        }
+    }
+
+    if (braking) {
+        if (!g_tmc->endPassiveBrakeTest()) failure = "hold_restore_failed";
+        braking = false;
+    }
+    stopStarted = settledSince = resumeIdleSince = 0;
+    g_tmc->estop();
+    g_recovery_failure.store(failure);
+    g_recovery.store(Recovery::FAILED);
+    return true;
+}
+#endif
+
 #ifdef HW_MOTOR_PASSIVE_BRAKE_TEST
-enum class BrakeTest : uint8_t { IDLE, PENDING, RUNNING, STOP, ESTOP, REFUSED, RESTORE_FAILED };
+enum class BrakeTest : uint8_t { IDLE, PENDING, RUNNING, STOP, ESTOP, REFUSED, FAILED, RESTORE_FAILED };
 static std::atomic<BrakeTest> g_brake_test{BrakeTest::IDLE};
 
 static bool brakeTestBusy(BrakeTest state) {
-    return state != BrakeTest::IDLE && state != BrakeTest::REFUSED;
+    return state != BrakeTest::IDLE && state != BrakeTest::REFUSED && state != BrakeTest::FAILED;
 }
 
 bool orionPassiveBrakeTestBusy() {
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+    if (g_recovery.load() != GravityRecovery::IDLE) return true;
+#endif
     return brakeTestBusy(g_brake_test.load());
 }
 
@@ -538,18 +692,27 @@ const char* orionPassiveBrakeTestStatus() {
         case BrakeTest::STOP:
         case BrakeTest::ESTOP:          return "stopping";
         case BrakeTest::REFUSED:        return "refused";
+        case BrakeTest::FAILED:         return "failed";
         case BrakeTest::RESTORE_FAILED: return "restore_failed";
     }
     return "idle";
 }
 
 bool orionStartPassiveBrakeTest() {
-    if (!g_tmc || (dmxIsActive() && orionDmxLastEnable() != 0)) return false;
+    if (!g_tmc || orionPassiveBrakeTestBusy() || (dmxIsActive() && orionDmxLastEnable() != 0)) return false;
     BrakeTest state = g_brake_test.load();
     return !brakeTestBusy(state) && g_brake_test.compare_exchange_strong(state, BrakeTest::PENDING);
 }
 
 bool orionStopPassiveBrakeTest(bool emergency) {
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+    if (emergency) {
+        auto recovery = g_recovery.load();
+        while (recovery != GravityRecovery::IDLE && recovery != GravityRecovery::FAILED) {
+            if (g_recovery.compare_exchange_weak(recovery, GravityRecovery::ABORT)) return true;
+        }
+    }
+#endif
     BrakeTest state = g_brake_test.load();
     while (state == BrakeTest::PENDING || state == BrakeTest::RUNNING || state == BrakeTest::STOP) {
         const BrakeTest next = emergency ? BrakeTest::ESTOP : BrakeTest::STOP;
@@ -573,7 +736,7 @@ static bool servicePassiveBrakeTest() {
         const MotorStatus status = g_tmc->getStatus();
         if (status.state == MotorState::IDLE && !status.fault_flags &&
             !sweep_active && !g_home_at_boot_at_ms && !g_drop_rehome_at_ms &&
-            !(g_motor_cmd & MOTOR_CMD_CLEAR_FAULT) &&
+            !(g_motor_cmd.load() & MOTOR_CMD_CLEAR_FAULT) &&
             !(dmxIsActive() && orionDmxLastEnable() != 0)) {
             engaged = g_tmc->beginPassiveBrakeTest();
             if (engaged) {
@@ -583,7 +746,11 @@ static bool servicePassiveBrakeTest() {
             if (g_tmc->getStatus().state == MotorState::FAULT) result = BrakeTest::RESTORE_FAILED;
         }
     } else if (engaged) {
-        if (state == BrakeTest::RUNNING && g_tmc->updatePassiveBrakeTest()) return true;
+        if (state == BrakeTest::RUNNING) {
+            const auto progress = g_tmc->updatePassiveBrakeTest();
+            if (progress == Tmc2209LocalDriver::BrakeProgress::RUNNING) return true;
+            if (progress == Tmc2209LocalDriver::BrakeProgress::FAILED) result = BrakeTest::FAILED;
+        }
         if (!g_tmc->endPassiveBrakeTest()) result = BrakeTest::RESTORE_FAILED;
         engaged = false;
     }
@@ -607,13 +774,23 @@ static void motorTask(void* arg) {
                 continue;
             }
 #endif
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+            if (serviceGravityRecovery()) {
+                vTaskDelay(delay);
+                continue;
+            }
+            if (g_recovery.load() != GravityRecovery::IDLE) {
+                g_driver->update();
+                vTaskDelay(delay);
+                continue;
+            }
+#endif
             // ── Deferred commands from webserver callbacks (core 0) ──────────
             // These involve UART writes or multi-field state mutations — unsafe
             // to call from core 0 while update() runs on core 1. Read and clear
-            // atomically (8-bit access is atomic on ESP32).
-            uint8_t cmd = g_motor_cmd;
+            // atomically.
+            const uint8_t cmd = g_motor_cmd.exchange(0);
             if (cmd) {
-                g_motor_cmd = 0;
                 if (cmd & MOTOR_CMD_CLEAR_FAULT) {
                     if (g_driver->clearFault()) {
                         ESP_LOGI(TAG, "fault cleared (deferred from UI/DMX)");
@@ -623,6 +800,9 @@ static void motorTask(void* arg) {
                         // auto-recovery: the position reference survived the
                         // stall (worm gear), so there is nothing to re-home.
                         if (orionConfig.autoRehomeOnStall && !orionConfig.manualMode
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+                            && !orionConfig.dropAndRehome
+#endif
                             && !orionConfig.keepHomeOnStall) {
                             if (orionConfig.dropAndRehome) {
                                 // Controlled-drop recovery: de-energise the
@@ -789,6 +969,12 @@ void initFixture() {
     // and calls setHomePosition() once the delay has elapsed, provided
     // _homed is still false (e.g. no /sethome was issued in the meantime).
     bool home_at_boot = orionConfig.homeAtBoot;
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+    if (home_at_boot && orionConfig.dropAndRehome) {
+        requestGravityRecovery();
+        home_at_boot = false;
+    }
+#endif
 #ifdef HW_MOTOR_RETAIN_ENABLE
     // A retained load can be above its home position when the ESP restarts.
     home_at_boot = home_at_boot && !g_tmc->retainedEnableAtBoot();
@@ -1043,7 +1229,12 @@ void handleDMX() {
 
     if (!g_driver) return;   // motor logic below requires the driver
 #ifdef HW_MOTOR_PASSIVE_BRAKE_TEST
-    if (orionPassiveBrakeTestBusy()) return;
+    if (brakeTestBusy(g_brake_test.load())) return;
+#endif
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+    const auto recovery = g_recovery.load();
+    if (recovery != GravityRecovery::IDLE && recovery != GravityRecovery::WAIT_FRAME &&
+        recovery != GravityRecovery::RESUMING) return;
 #endif
 
     // Per-universe freshness check FIRST, so a re-arming console (new frame
@@ -1051,6 +1242,10 @@ void handleDMX() {
     // and re-kicks the timer — otherwise the early-return in the next block
     // would freeze us in the post-action state forever.
     uint32_t last_frame = getUniverseLastSeen(dmxConfig.startUniverse);
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+    if (recovery == GravityRecovery::WAIT_FRAME &&
+        !recoveryFrameCanResume(last_frame, g_recovery_frame_cutoff.load(), millis())) return;
+#endif
     static uint32_t prev_seen = 0;
     bool fresh_frame = (last_frame != 0) && (last_frame != prev_seen);
     prev_seen = last_frame;
@@ -1119,7 +1314,17 @@ void handleDMX() {
 
     // Function byte: edge-triggered for homing/clearfault; 5 s hold + Enable=0
     // gate for SET_DOWN_LIMIT / SET_UP_LIMIT — must run regardless of enable state
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+    if (recovery == GravityRecovery::IDLE) {
+        applyFunction(function_b, enable_b);
+    } else {
+        // Resume position only. Do not replay an armed function command.
+        g_function_holding = decodeFunction(function_b);
+        g_function_fired = true;
+    }
+#else
     applyFunction(function_b, enable_b);
+#endif
 
     if (enable_b == 0) return;
 
@@ -1192,6 +1397,23 @@ void handleDMX() {
     // re-issue above, already fixed by only calling setSpeed()/setAccel()
     // on an actual byte change — moveTo() itself tracks the real target
     // every frame here, however small the per-frame delta.
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+    if (recovery == GravityRecovery::WAIT_FRAME) {
+        if (!validGravityTravel()) return;
+        g_recovery_resume_target.store(target);
+        auto expected = GravityRecovery::WAIT_FRAME;
+        if (!g_recovery.compare_exchange_strong(expected, GravityRecovery::RESUMING)) return;
+        g_dmx_last_target = INT32_MIN;
+        g_driver->setSpeed(speed_b ? (float)orionConfig.maxSpeed * speed_b / 255.0f :
+                                    (float)orionConfig.maxSpeed);
+        g_driver->setAccel(accel_b ? (float)orionConfig.maxAccel * accel_b / 255.0f :
+                                    (float)orionConfig.maxAccel);
+    }
+    const auto currentRecovery = g_recovery.load();
+    if (currentRecovery != GravityRecovery::IDLE && currentRecovery != GravityRecovery::RESUMING)
+        return;
+    if (currentRecovery == GravityRecovery::RESUMING) g_recovery_resume_target.store(target);
+#endif
     if (g_dmx_last_target == INT32_MIN || target != g_dmx_last_target) {
         g_driver->moveTo(target);
         g_dmx_last_target = target;
@@ -1310,14 +1532,17 @@ void    orionReleaseToDmx() {
 // avoid UART races with the periodic register reads in update().
 bool orionClearFaultAndMaybeHome() {
     if (!g_driver) return false;
-    g_motor_cmd |= MOTOR_CMD_CLEAR_FAULT;
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+    if (g_recovery.load() != GravityRecovery::IDLE) return false;
+#endif
+    g_motor_cmd.fetch_or(MOTOR_CMD_CLEAR_FAULT);
     return true;
 }
 
 void orionApplyMotorCurrents() {
     // Post a deferred command to the motor task — UART writes to the TMC2209
     // must not race with the motor task's periodic register reads on core 1.
-    g_motor_cmd |= MOTOR_CMD_APPLY_CURRENTS;
+    g_motor_cmd.fetch_or(MOTOR_CMD_APPLY_CURRENTS);
 }
 
 // Re-push the homing config into the TMC2209 backend after the UI changes

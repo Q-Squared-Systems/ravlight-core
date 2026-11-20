@@ -14,7 +14,7 @@ static const char* TAG = "ORION_WEB";
 static bool rejectDuringPassiveBrakeTest(AsyncWebServerRequest* request) {
 #ifdef HW_MOTOR_PASSIVE_BRAKE_TEST
     if (orionPassiveBrakeTestBusy()) {
-        request->send(409, "text/plain", "Passive brake test must finish first");
+        request->send(409, "text/plain", "Motor controls are blocked by braking or recovery");
         return true;
     }
 #else
@@ -149,11 +149,64 @@ static const char* stateName(MotorState s) {
     return "unknown";
 }
 
+#ifdef RAVLIGHT_TMC_RECOVERY_DIAGNOSTICS
+static void addRegisterRead(JsonObject object, const char* name,
+                            Tmc2209LocalDriver::RegisterRead sample) {
+    if (sample.valid) object[name] = sample.value;
+    else object[name] = nullptr;
+}
+
+static const char* checkRegister(Tmc2209LocalDriver::RegisterRead actual, uint32_t expected) {
+    if (!actual.valid) return "read_failed";
+    return actual.value == expected ? "match" : "mismatch";
+}
+
+static void addProfileTrace(JsonObject object, const Tmc2209LocalDriver::ProfileTrace& trace) {
+    object["result"] = trace.result;
+    object["attempts"] = trace.attempts;
+    if (!trace.attempts) return;
+
+    JsonObject uart = object.createNestedObject("ifcnt");
+    addRegisterRead(uart, "before", trace.ifcntBefore);
+    addRegisterRead(uart, "after", trace.ifcntAfter);
+    uart["expectedDelta"] = trace.expectedWrites;
+    if (trace.ifcntBefore.valid && trace.ifcntAfter.valid)
+        uart["actualDelta"] = static_cast<uint8_t>(trace.ifcntAfter.value - trace.ifcntBefore.value);
+
+    if (trace.targetKnown) {
+        JsonObject target = object.createNestedObject("written");
+        target["GCONF"] = trace.targetGconf;
+        target["PWMCONF"] = trace.targetPwmconf;
+        if (trace.expectedWrites == 3) target["IHOLD_IRUN"] = trace.targetCurrents;
+    }
+
+    const auto& registers = trace.readback;
+    JsonObject raw = object.createNestedObject("readback");
+    raw["uptimeMs"] = registers.uptimeMs;
+    addRegisterRead(raw, "GCONF", registers.gconf);
+    addRegisterRead(raw, "PWMCONF", registers.pwmconf);
+    addRegisterRead(raw, "IOIN", registers.ioin);
+    addRegisterRead(raw, "DRV_STATUS", registers.drvStatus);
+    addRegisterRead(raw, "TSTEP", registers.tstep);
+
+    JsonObject checks = object.createNestedObject("checks");
+    if (trace.targetKnown) {
+        checks["expectedEffectiveGCONF"] = trace.expectedEffectiveGconf;
+        checks["GCONF"] = checkRegister(registers.gconf, trace.expectedEffectiveGconf);
+        checks["PWMCONF"] = checkRegister(registers.pwmconf, trace.targetPwmconf);
+    }
+    if (registers.ioin.valid) checks["spreadPinHigh"] = (registers.ioin.value & (1u << 8)) != 0;
+    if (registers.gconf.valid) checks["spreadCycleSelected"] = (registers.gconf.value & (1u << 2)) != 0;
+    checks["activeChopper"] = !registers.drvStatus.valid ? "read_failed" :
+        (registers.drvStatus.value & (1u << 30)) ? "StealthChop" : "SpreadCycle";
+}
+#endif
+
 void registerFixtureRoutes(AsyncWebServer& server) {
     // GET /motorstatus — JSON snapshot for UI polling
     server.on("/motorstatus", HTTP_GET, [](AsyncWebServerRequest* req) {
         IMotorDriver* drv = orionGetDriver();
-        StaticJsonDocument<512> doc;
+        StaticJsonDocument<768> doc;
 
         if (!drv) {
             doc["available"] = false;
@@ -179,8 +232,21 @@ void registerFixtureRoutes(AsyncWebServer& server) {
             doc["operSgthrs"] = orionConfig.operSgthrs;
             doc["homingSpeed"]= ORION_HOMING_SPEED;
             doc["manualMode"] = orionConfig.manualMode;
+#ifdef RAVLIGHT_TMC_STEALTHCHOP_TRIAL
+            if (auto* tmc = orionGetTmcDriver()) {
+                doc["chopperModeAtIdle"] = tmc->chopperModeAtIdle();
+#ifdef RAVLIGHT_TMC_COOLSTEP_TRIAL
+                doc["coolStepConfigured"] = tmc->coolStepConfigured();
+#endif
+            }
+#endif
 #ifdef HW_MOTOR_PASSIVE_BRAKE_TEST
             doc["passiveBrakeTest"] = orionPassiveBrakeTestStatus();
+#endif
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+            doc["gravityRecovery"] = orionGravityRecoveryStatus();
+            if (const char* failure = orionGravityRecoveryFailure())
+                doc["gravityRecoveryFailure"] = failure;
 #endif
         }
 
@@ -188,6 +254,31 @@ void registerFixtureRoutes(AsyncWebServer& server) {
         serializeJson(doc, out);
         req->send(200, "application/json", out);
     });
+
+#ifdef RAVLIGHT_TMC_RECOVERY_DIAGNOSTICS
+    server.on("/api/tmc-recovery", HTTP_GET, [](AsyncWebServerRequest* req) {
+        auto* tmc = orionGetTmcDriver();
+        if (!tmc) {
+            req->send(503, "text/plain", "Driver unavailable");
+            return;
+        }
+        const auto traces = tmc->profileDiagnostics();
+        StaticJsonDocument<2048> doc;
+        addProfileTrace(doc.createNestedObject("bootProfile"), traces.bootProfile);
+        addProfileTrace(doc.createNestedObject("recoveryRestore"), traces.recoveryRestore);
+        if (doc.overflowed()) {
+            req->send(503, "text/plain", "Diagnostic buffer unavailable");
+            return;
+        }
+        String out;
+        const size_t length = measureJson(doc);
+        if (!out.reserve(length) || serializeJson(doc, out) != length) {
+            req->send(503, "text/plain", "Diagnostic buffer unavailable");
+            return;
+        }
+        req->send(200, "application/json", out);
+    });
+#endif
 
 #ifdef HW_MOTOR_PASSIVE_BRAKE_TEST
     server.on("/passive-brake-test", HTTP_POST, [](AsyncWebServerRequest* req) {

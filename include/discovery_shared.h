@@ -25,14 +25,14 @@ struct DeviceInfo {
     uint32_t lastSeen;
 };
 
-extern std::vector<DeviceInfo> ScannedDevices;
+bool addDiscoveredDevice(const DeviceInfo& device);
 
 void clearDevices();
 void startCombinedDiscovery(bool withESPNow = false);
 void triggerESPNowScanStart();   // called by Ticker 200ms after HTTP response (WiFi STA case)
 void updateCombinedDiscovery();
 bool isDiscoveryRunning();
-const std::vector<DeviceInfo>& getDiscoveredUDPDevices();
+std::vector<DeviceInfo> getDiscoveredUDPDevices();
 void printDiscoveredDevices();
 
 #endif // RAVLIGHT_MASTER || RAVLIGHT_MODULE_DISCOVERY

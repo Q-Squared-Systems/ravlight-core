@@ -152,9 +152,6 @@ void updateUDPDiscovery() {
         String mac = doc["mac"] | "";
         if (mac.isEmpty()) return;
         if (mac == getSerialNumber()) return;  // skip self
-        for (const auto& d : ScannedDevices) {
-            if (d.mac == mac) return;   // duplicate
-        }
         DeviceInfo info;
         info.id       = doc["id"]      | "n/a";
         info.ip       = doc["ip"]      | "n/a";
@@ -165,7 +162,7 @@ void updateUDPDiscovery() {
         info.temp     = doc["temp"]   | 0.0f;
         info.uptime   = doc["uptime"] | (uint32_t)0;
         info.lastSeen = (uint32_t)(esp_timer_get_time() / 1000ULL);
-        ScannedDevices.push_back(info);
+        if (!addDiscoveredDevice(info)) return;
         ESP_LOGI("UDP", "Device added: %s @ %s", info.id.c_str(), info.ip.c_str());
     });
     ESP_LOGI("UDP", "Listening for responses on port %d", DISC_UDP_RESPONSE_PORT);

@@ -123,6 +123,10 @@ def main():
     base = env.GetProjectOption("custom_fw_name") or "unknown"  # noqa: F821
     env.Append(CPPDEFINES=[("RAVLIGHT_FW_BASE", env.StringifyMacro(base))])  # noqa: F821
 
+    version = env.GetProjectOption("custom_fw_version", "")  # noqa: F821
+    if version:
+        env.Append(CPPDEFINES=[("FW_VERSION", env.StringifyMacro(version))])  # noqa: F821
+
     print(f"[embed_assets] {len(entries)} assets -> web_assets.h "
           f"({raw_total} B raw -> {emb_total} B embedded, fixture={active_fixture()}, base={base})")
 
