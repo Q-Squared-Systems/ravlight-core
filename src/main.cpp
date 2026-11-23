@@ -35,6 +35,7 @@
   #include "effects.h"
 #endif
 #include "core/oled.h"
+#include "fixtures/orion/motor_event_log.h"
 
 void setup() {
 #ifndef RAVLIGHT_DISABLE_SERIAL
@@ -55,6 +56,9 @@ void setup() {
 
     intiConfig();
     initRuntime();
+#ifdef RAVLIGHT_ORION_MOTOR_EVENT_LOG
+    OrionMotorEvents::begin();
+#endif
 
     // OLED splash first, before any network bring-up: it only needs the
     // compile-time PROJECT_NAME/FW_VERSION (see core/oled.cpp), so there is
@@ -136,6 +140,9 @@ void loop() {
 
     checkNetwork();
     updateRuntime();
+#ifdef RAVLIGHT_ORION_MOTOR_EVENT_LOG
+    OrionMotorEvents::service();
+#endif
     tickDmxFps();
 #ifdef RAVLIGHT_MODULE_DISCOVERY
     updateCombinedDiscovery();

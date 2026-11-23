@@ -5,7 +5,7 @@
 #include "freertos/semphr.h"
 
 #define DMX_BUFFER_SIZE   513
-#define DMX_MAX_UNIVERSES  48   // max universes in pool (48 × 513 B ≈ 24 KB; 8 ch × 6 univ @ 1024 px RGB)
+#define DMX_MAX_UNIVERSES  48   // max registered double-buffered universes
 
 extern uint8_t dmxBuffer[DMX_BUFFER_SIZE];  // legacy single-universe buffer (startUniverse)
 extern SemaphoreHandle_t dmxBufferMutex;
@@ -14,7 +14,11 @@ extern bool handleDMXenable;
 // ── Universe pool API ────────────────────────────────────────────────────────
 // Fixtures call registerDmxUniverse() in initFixture() BEFORE initDmxInputs().
 // initDmxInputs() auto-registers startUniverse for single-universe fixtures.
-void registerDmxUniverse(uint16_t universe);
+bool registerDmxUniverse(uint16_t universe);
+#ifdef RAVLIGHT_ORION_COMPACT_DMX_POOL
+bool registerDmxUniverses(const uint16_t* ids, uint8_t count);
+void joinNewDmxUniverses(uint8_t first);
+#endif
 
 // Returns pointer to channel data for a registered universe (1-indexed: [1]=ch1).
 // Returns nullptr if universe not registered. Lock-free: returns the active

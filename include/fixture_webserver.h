@@ -9,5 +9,11 @@
 // from POST /api/config (SPA path — body fields go through here).
 void handleFixtureSaveParams(AsyncWebServerRequest* request, bool& needsRestart);
 
+#ifdef RAVLIGHT_ORION_COMPACT_DMX_POOL
+#include <ArduinoJson.h>
+bool reserveOrionFormDmxPatch(AsyncWebServerRequest* request, uint16_t motorUniverse);
+bool reserveOrionJsonDmxPatch(JsonObjectConst fixture, uint16_t motorUniverse);
+#endif
+
 // Register fixture-specific HTTP routes (e.g. /highlight, /home, /sgcal).
 void registerFixtureRoutes(AsyncWebServer& server);

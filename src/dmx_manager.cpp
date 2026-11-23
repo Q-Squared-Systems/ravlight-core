@@ -16,6 +16,10 @@
 #include <lwip/sockets.h>
 #include <fcntl.h>
 #include <string.h>
+#ifdef RAVLIGHT_ORION_COMPACT_DMX_POOL
+#include <atomic>
+#include <esp_heap_caps.h>
+#endif
 
 #if defined(RAVLIGHT_MODULE_DMX_PHYSICAL) || defined(RAVLIGHT_MODULE_DMX_PHYSICAL_2)
 #include <esp_dmx.h>
@@ -79,8 +83,20 @@ struct universe_slot_t {
     uint8_t  pending_dirty;    // 1 if data[1-active_idx] has new bytes awaiting an ArtSync swap
     uint8_t  data[2][513];     // double buffer; [0] unused channel slot per buffer
 };
+#ifdef RAVLIGHT_ORION_COMPACT_DMX_POOL
+static universe_slot_t* universePool[DMX_MAX_UNIVERSES]{};
+static std::atomic<uint8_t> universeCount{0};
+static portMUX_TYPE universeRegistryMux = portMUX_INITIALIZER_UNLOCKED;
+
+static universe_slot_t& universeSlot(uint8_t idx) { return *universePool[idx]; }
+uint8_t dmxUniverseCount() { return universeCount.load(std::memory_order_acquire); }
+#else
 static universe_slot_t universePool[DMX_MAX_UNIVERSES];
-static uint8_t         universeCount = 0;
+static uint8_t universeCount = 0;
+
+static universe_slot_t& universeSlot(uint8_t idx) { return universePool[idx]; }
+uint8_t dmxUniverseCount() { return universeCount; }
+#endif
 
 // Sync packet tracking — covers both Art-Net 4 ArtSync (opcode 0x5200) and
 // E1.31 Extended Synchronization (VECTOR_E131_EXTENDED_SYNCHRONIZATION). When
@@ -97,26 +113,84 @@ static inline bool sync_active(uint32_t now_ms) {
     return s_sync_last_ms != 0 && (now_ms - s_sync_last_ms) < SYNC_TIMEOUT_MS;
 }
 
-void registerDmxUniverse(uint16_t universe) {
+#ifdef RAVLIGHT_ORION_COMPACT_DMX_POOL
+bool registerDmxUniverses(const uint16_t* ids, uint8_t requested) {
+    for (;;) {
+        const uint8_t existing = dmxUniverseCount();
+        uint16_t missing[DMX_MAX_UNIVERSES];
+        uint8_t count = 0;
+        for (uint8_t i = 0; i < requested; ++i) {
+            bool found = false;
+            for (uint8_t j = 0; j < existing && !found; ++j)
+                found = universeSlot(j).id == ids[i];
+            for (uint8_t j = 0; j < count && !found; ++j)
+                found = missing[j] == ids[i];
+            if (found) continue;
+            if (existing + count == DMX_MAX_UNIVERSES) {
+                ESP_LOGW(TAG, "Universe pool full, cannot register u%d", ids[i]);
+                return false;
+            }
+            missing[count++] = ids[i];
+        }
+        if (!count) return true;
+
+        universe_slot_t* pending[DMX_MAX_UNIVERSES];
+        uint8_t allocated = 0;
+        for (; allocated < count; ++allocated) {
+            auto* slot = static_cast<universe_slot_t*>(
+                heap_caps_calloc(1, sizeof(universe_slot_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
+            if (!slot) break;
+            slot->id = missing[allocated];
+            pending[allocated] = slot;
+        }
+        // Published slots are immutable in the directory and retained until
+        // reboot. Existing payload readers can keep their raw buffer pointers.
+        portENTER_CRITICAL(&universeRegistryMux);
+        const bool changed = existing != dmxUniverseCount();
+        const bool published = !changed && allocated == count;
+        if (published) {
+            for (uint8_t i = 0; i < count; ++i) universePool[existing + i] = pending[i];
+            universeCount.store(existing + count, std::memory_order_release);
+        }
+        portEXIT_CRITICAL(&universeRegistryMux);
+        if (published) {
+            ESP_LOGI(TAG, "Registered %d universe(s), total %d", count, existing + count);
+            return true;
+        }
+        while (allocated) heap_caps_free(pending[--allocated]);
+        if (!changed) {
+            ESP_LOGW(TAG, "Internal RAM unavailable for DMX universe registration");
+            return false;
+        }
+    }
+}
+#endif
+
+bool registerDmxUniverse(uint16_t universe) {
+#ifdef RAVLIGHT_ORION_COMPACT_DMX_POOL
+    return registerDmxUniverses(&universe, 1);
+#else
     for (int i = 0; i < universeCount; i++)
-        if (universePool[i].id == universe) return;
+        if (universeSlot(i).id == universe) return true;
     if (universeCount >= DMX_MAX_UNIVERSES) {
         ESP_LOGW(TAG, "Universe pool full, ignoring u%d", universe);
-        return;
+        return false;
     }
     memset(&universePool[universeCount], 0, sizeof(universe_slot_t));
     universePool[universeCount].id = universe;
     universeCount++;
     ESP_LOGI(TAG, "Registered universe %d (total %d)", universe, universeCount);
+    return true;
+#endif
 }
 
 const uint8_t* getUniverseData(uint16_t universe) {
     // Lock-free read: the render task sees the active buffer; ArtSync swaps
     // active_idx atomically (single-byte write). Writes to the pending buffer
     // by the network task never touch the active buffer that we return here.
-    for (int i = 0; i < universeCount; i++)
-        if (universePool[i].id == universe)
-            return universePool[i].data[universePool[i].active_idx];
+    for (int i = 0; i < dmxUniverseCount(); i++)
+        if (universeSlot(i).id == universe)
+            return universeSlot(i).data[universeSlot(i).active_idx];
     return nullptr;
 }
 
@@ -129,17 +203,17 @@ static void writeToPool(uint16_t universe, const uint8_t* src, uint16_t size) {
     uint32_t now = millis();
     bool immediate = !sync_active(now);
 
-    for (int i = 0; i < universeCount; i++) {
-        if (universePool[i].id != universe) continue;
-        uint8_t pending = 1 - universePool[i].active_idx;
-        memcpy(universePool[i].data[pending] + 1, src, n);
-        universePool[i].last_seen_ms = now;
+    for (int i = 0; i < dmxUniverseCount(); i++) {
+        if (universeSlot(i).id != universe) continue;
+        uint8_t pending = 1 - universeSlot(i).active_idx;
+        memcpy(universeSlot(i).data[pending] + 1, src, n);
+        universeSlot(i).last_seen_ms = now;
         if (immediate) {
             // No ArtSync mode: swap inline so this frame is visible right away.
-            universePool[i].active_idx   = pending;
-            universePool[i].pending_dirty = 0;
+            universeSlot(i).active_idx   = pending;
+            universeSlot(i).pending_dirty = 0;
         } else {
-            universePool[i].pending_dirty = 1;
+            universeSlot(i).pending_dirty = 1;
         }
         if (universe == dmxConfig.startUniverse)
             memcpy(dmxBuffer + 1, src, n);
@@ -151,10 +225,10 @@ static void writeToPool(uint16_t universe, const uint8_t* src, uint16_t size) {
 // from onArtnetPacket() on ArtSync receipt under dmxBufferMutex, and also
 // deferred-applied at the start of each render frame (see dmxApplyPendingSwap).
 static void artsyncSwapDirty() {
-    for (int i = 0; i < universeCount; i++) {
-        if (universePool[i].pending_dirty) {
-            universePool[i].active_idx ^= 1;
-            universePool[i].pending_dirty = 0;
+    for (int i = 0; i < dmxUniverseCount(); i++) {
+        if (universeSlot(i).pending_dirty) {
+            universeSlot(i).active_idx ^= 1;
+            universeSlot(i).pending_dirty = 0;
         }
     }
 }
@@ -176,13 +250,12 @@ uint32_t artsyncPacketCount()  { return s_artsync_packets;  }
 uint32_t sacnsyncPacketCount() { return s_sacnsync_packets; }
 
 uint32_t getUniverseLastSeen(uint16_t universe) {
-    for (int i = 0; i < universeCount; i++)
-        if (universePool[i].id == universe) return universePool[i].last_seen_ms;
+    for (int i = 0; i < dmxUniverseCount(); i++)
+        if (universeSlot(i).id == universe) return universeSlot(i).last_seen_ms;
     return 0;
 }
 
-uint8_t  dmxUniverseCount()           { return universeCount; }
-uint16_t dmxUniverseAt(uint8_t idx)   { return (idx < universeCount) ? universePool[idx].id : 0; }
+uint16_t dmxUniverseAt(uint8_t idx)   { return (idx < dmxUniverseCount()) ? universeSlot(idx).id : 0; }
 
 // Runtime gates for the ArtNet + sACN receive paths — declared here
 // (before writeToPoolSacn / onArtnetPacket reference them) so both the
@@ -223,8 +296,8 @@ void tickDmxFps(void) {
     if (!dmxIsActive() && da == 0) { s_dmx_fps = 0; return; }
 
     uint8_t n_active = 0;
-    for (int i = 0; i < universeCount; i++) {
-        uint32_t last = universePool[i].last_seen_ms;
+    for (int i = 0; i < dmxUniverseCount(); i++) {
+        uint32_t last = universeSlot(i).last_seen_ms;
         if (last != 0 && (now - last) < 1500) n_active++;
     }
     if (n_active == 0) n_active = 1;
@@ -374,7 +447,7 @@ void initArtnet() {
         return;
     }
     artnetUdp.onPacket(onArtnetPacket);
-    ESP_LOGI(TAG, "ArtNet UDP ready (port %d, %d universes)", ARTNET_PORT, universeCount);
+    ESP_LOGI(TAG, "ArtNet UDP ready (port %d, %d universes)", ARTNET_PORT, dmxUniverseCount());
 #ifdef RAVLIGHT_MODULE_ARTRDM
     artRdmInit();
 #endif
@@ -601,13 +674,13 @@ void initE131() {
     struct timeval tv = {0, 200000};
     setsockopt(sacnSock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-    for (int i = 0; i < universeCount; i++)
-        sacnJoinUniverse((uint16_t)(universePool[i].id + 1));  // pool is 0-indexed, E1.31 is 1-indexed
+    for (int i = 0; i < dmxUniverseCount(); i++)
+        sacnJoinUniverse((uint16_t)(universeSlot(i).id + 1));  // pool is 0-indexed, E1.31 is 1-indexed
 
     xTaskCreatePinnedToCore(sacnTaskFn, "sacn_rx", 4096, NULL, 5,
                             &sacnTaskHandle, 0);  // Core 0: network / lwIP side
 
-    ESP_LOGI(TAG, "sACN UDP ready (port %d, %d universes)", SACN_PORT, universeCount);
+    ESP_LOGI(TAG, "sACN UDP ready (port %d, %d universes)", SACN_PORT, dmxUniverseCount());
 }
 
 // E1.31 packet layout (ANSI E1.31-2018):
@@ -999,10 +1072,10 @@ void reinitDMXInput() {
     // window — visible on strips as a brief garbage-coloured flash
     // ("glitch tra built-in e artnet").
     if (xSemaphoreTake(dmxBufferMutex, portMAX_DELAY) == pdTRUE) {
-        for (int i = 0; i < universeCount; i++) {
-            memset(universePool[i].data[0], 0, sizeof(universePool[i].data[0]));
-            memset(universePool[i].data[1], 0, sizeof(universePool[i].data[1]));
-            universePool[i].pending_dirty = 0;
+        for (int i = 0; i < dmxUniverseCount(); i++) {
+            memset(universeSlot(i).data[0], 0, sizeof(universeSlot(i).data[0]));
+            memset(universeSlot(i).data[1], 0, sizeof(universeSlot(i).data[1]));
+            universeSlot(i).pending_dirty = 0;
         }
         memset(dmxBuffer, 0, DMX_BUFFER_SIZE);
         xSemaphoreGive(dmxBufferMutex);
@@ -1058,7 +1131,7 @@ void reinitDMXInput() {
 }
 
 void reinitUniverse(uint16_t universe) {
-    registerDmxUniverse(universe);
+    if (!registerDmxUniverse(universe)) return;
     // For sACN, just join the new multicast group if socket is already open.
     // For ArtNet, INADDR_ANY receives all universes — no extra action needed.
     if (dmxConfig.dmxInput == SACN) {
@@ -1069,6 +1142,16 @@ void reinitUniverse(uint16_t universe) {
     }
     ESP_LOGI(TAG, "Universe reinitialized: %d", universe);
 }
+
+#ifdef RAVLIGHT_ORION_COMPACT_DMX_POOL
+void joinNewDmxUniverses(uint8_t first) {
+    if (dmxConfig.dmxInput != SACN || sacnSock < 0) return;
+    const uint8_t count = dmxUniverseCount();
+    for (uint8_t i = first; i < count; ++i) {
+        sacnJoinUniverse(static_cast<uint16_t>(universeSlot(i).id + 1));
+    }
+}
+#endif
 
 void reinitDMXOutput(bool enable) {
     ESP_LOGI(TAG, "Output %s", enable ? "enabled" : "disabled");

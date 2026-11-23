@@ -11,6 +11,60 @@ static const char* TAG = "ORION_CFG";
 
 OrionConfig orionConfig;
 
+#ifdef RAVLIGHT_ORION_COMPACT_DMX_POOL
+bool orionReserveDmxPatch(uint16_t motorUniverse, const led_output_cfg_t* outputs, uint8_t outputCount) {
+    uint16_t ids[DMX_MAX_UNIVERSES] = {motorUniverse};
+    uint8_t count = 1;
+    for (uint8_t i = 0; i < outputCount; ++i) {
+        const auto& output = outputs[i];
+        if (output.protocol == LED_PWM || output.protocol == LED_RELAY) continue;
+        const uint32_t channels = led_dmx_channels(&output);
+        if (!channels) continue;
+        if (!output.dmx_start) return false;
+        const uint32_t start = output.dmx_start - 1u;
+        const uint32_t first = output.universe_start + start / 512;
+        const uint32_t last = output.universe_start + (start + channels - 1) / 512;
+        if (last > UINT16_MAX || last - first >= DMX_MAX_UNIVERSES) return false;
+        for (uint32_t id = first; id <= last; ++id) {
+            bool found = false;
+            for (uint8_t j = 0; j < count && !found; ++j) found = ids[j] == id;
+            if (found) continue;
+            if (count == DMX_MAX_UNIVERSES) return false;
+            ids[count++] = static_cast<uint16_t>(id);
+        }
+    }
+    return registerDmxUniverses(ids, count);
+}
+#endif
+
+#ifdef ORION_HAS_LED
+static JsonArrayConst orionLedOutputs(JsonObjectConst fixture) {
+    JsonArrayConst outputs = fixture["outputs"].as<JsonArrayConst>();
+    return outputs.isNull() ? fixture["ledOutputs"].as<JsonArrayConst>() : outputs;
+}
+
+static void readOrionLedPatch(JsonObjectConst input, uint8_t index, led_output_cfg_t& output) {
+    output.protocol = static_cast<led_protocol_t>(input["proto"] | static_cast<int>(LED_WS2812B));
+    output.pixel_count = input["count"] | static_cast<uint16_t>(0);
+    output.universe_start = input["univ"] | static_cast<uint16_t>(index);
+    output.dmx_start = input["ch"] | static_cast<uint16_t>(1);
+    output.grouping = input["group"] | static_cast<uint8_t>(1);
+    if (!output.grouping) output.grouping = 1;
+}
+
+#ifdef RAVLIGHT_ORION_COMPACT_DMX_POOL
+bool reserveOrionJsonDmxPatch(JsonObjectConst fixture, uint16_t motorUniverse) {
+    led_output_cfg_t outputs[HW_LED_OUTPUT_COUNT];
+    const auto inputs = orionLedOutputs(fixture);
+    for (uint8_t i = 0; i < HW_LED_OUTPUT_COUNT; ++i) {
+        outputs[i] = orionConfig.ledOutputs[i];
+        if (i < inputs.size()) readOrionLedPatch(inputs[i].as<JsonObjectConst>(), i, outputs[i]);
+    }
+    return orionReserveDmxPatch(motorUniverse, outputs, HW_LED_OUTPUT_COUNT);
+}
+#endif
+#endif
+
 // Steps per cm of real fixture travel, from the mechanical calibration.
 // One drum revolution = motorStepsPerRev x 16 microsteps x gearRatio steps, and
 // moves the fixture by the drum circumference (pi x diameter).
@@ -230,10 +284,9 @@ void fixtureConfigDeserialize(const JsonObject& fix) {
     }
 
 #ifdef ORION_HAS_LED
-    JsonArrayConst outputs = fix["outputs"].as<JsonArrayConst>();
     // "ledOutputs" is the pre-unification spelling — still read so configs
     // saved by older firmware survive the upgrade. Dropped on the next save.
-    if (outputs.isNull()) outputs = fix["ledOutputs"].as<JsonArrayConst>();
+    JsonArrayConst outputs = orionLedOutputs(fix);
     if (outputs.isNull()) {
         // No array at all: leave every output as-is rather than resetting them
         // to defaults (which would also trigger a spurious restart).
@@ -246,17 +299,12 @@ void fixtureConfigDeserialize(const JsonObject& fix) {
     for (int i = 0; i < n; i++) {
         led_output_cfg_t& o  = orionConfig.ledOutputs[i];
         JsonObjectConst out  = outputs[i].as<JsonObjectConst>();
-        o.protocol       = (led_protocol_t)(out["proto"] | (int)LED_WS2812B);
-        o.pixel_count    = out["count"] | (uint16_t)0;
-        o.universe_start = out["univ"]  | (uint16_t)i;
-        o.dmx_start      = out["ch"]    | (uint16_t)1;
-        o.grouping       = out["group"] | (uint8_t)1;
+        readOrionLedPatch(out, i, o);
         o.invert         = out["inv"]   | (uint8_t)0;
         o.brightness     = out["bri"]   | (uint8_t)255;
         o.gamma_x10      = out["gamma"] | (uint8_t)10;
         if (o.gamma_x10 < 10) o.gamma_x10 = 10;
         if (o.gamma_x10 > 30) o.gamma_x10 = 30;
-        if (o.grouping == 0) o.grouping = 1;
         o.pwm_freq_hz     = out["pwm_freq"]   | (uint16_t)0;
         o.pwm_curve       = out["pwm_curve"]  | (uint8_t)0;
         o.pwm_16bit       = out["pwm_16bit"]  | (uint8_t)0;

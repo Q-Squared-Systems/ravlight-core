@@ -785,7 +785,7 @@
     // (raw step target). The backend enters manual override on the first
     // call — same as /jog — so DMX won't fight the drag; the operator hits
     // "Release to DMX" (see oReleaseBtn state above) to hand control back.
-    let _dragging = false, _dragLastSent = 0;
+    let _dragging = false, _dragLastSent = 0, _dragErrorShown = false;
 
     // Convert a pointer Y into a raw step target using the same track
     // geometry as updateTravelViz(), and paint the load/cable optimistically
@@ -810,15 +810,27 @@
         return Math.round(sign * f * travelSteps);
     }
 
-    function orionMoveTo(steps) {
+    async function orionMoveTo(steps) {
         const fd = new FormData();
         fd.append('pos', steps);
-        fetch('/moveto', {method: 'POST', body: fd}).catch(() => {});
+        let message;
+        try {
+            const response = await fetch('/moveto', {method: 'POST', body: fd});
+            if (response.ok) return;
+            message = await response.text();
+        } catch {
+            message = 'Could not reach the motor controller';
+        }
+        if (!_dragErrorShown) {
+            _dragErrorShown = true;
+            showToast(message || 'Position request failed');
+        }
     }
 
     window.orionDragStart = function (e) {
         e.preventDefault();
         _dragging = true;
+        _dragErrorShown = false;
         const load = document.getElementById('ovLoad');
         if (load && load.setPointerCapture) { try { load.setPointerCapture(e.pointerId); } catch (err) {} }
         document.addEventListener('pointermove', orionDragMove);

@@ -297,6 +297,16 @@ void initWebServer() {
 #ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
         if (rejectConfigDuringGravityReturn(request)) return;
 #endif
+#ifdef RAVLIGHT_ORION_COMPACT_DMX_POOL
+        const uint16_t requestedUniverse = request->hasParam("startUniverse", true)
+            ? request->getParam("startUniverse", true)->value().toInt() : dmxConfig.startUniverse;
+        const uint8_t firstNew = dmxUniverseCount();
+        if (!reserveOrionFormDmxPatch(request, requestedUniverse)) {
+            request->send(409, "application/json", "{\"ok\":false,\"error\":\"Cannot register requested DMX universes\"}");
+            return;
+        }
+        joinNewDmxUniverses(firstNew);
+#endif
         bool needsRestart = false;
         String newIp = netConfig.currentip;
 
@@ -324,7 +334,9 @@ void initWebServer() {
             uint16_t v = request->getParam("startUniverse", true)->value().toInt();
             if (v != dmxConfig.startUniverse) {
                 dmxConfig.startUniverse = v;
+#ifndef RAVLIGHT_ORION_COMPACT_DMX_POOL
                 reinitUniverse(v);
+#endif
             }
         }
         if (request->hasParam("dmxOutput", true) != dmxConfig.dmxOutputEnabled) {
@@ -871,6 +883,15 @@ x.send(fd);}</script></body></html>)HTML";
             DynamicJsonDocument body(4096);
             if (!parseConfigBody(request, body)) return;
             JsonObject doc = body.as<JsonObject>();
+#ifdef RAVLIGHT_ORION_COMPACT_DMX_POOL
+            const uint16_t requestedUniverse = doc["dmx"]["universe"] | dmxConfig.startUniverse;
+            const uint8_t firstNew = dmxUniverseCount();
+            if (!reserveOrionJsonDmxPatch(doc["fixture"].as<JsonObjectConst>(), requestedUniverse)) {
+                request->send(409, "application/json", "{\"ok\":false,\"error\":\"Cannot register requested DMX universes\"}");
+                return;
+            }
+            joinNewDmxUniverses(firstNew);
+#endif
             bool restartNeeded = false;
             String restartReason;
 

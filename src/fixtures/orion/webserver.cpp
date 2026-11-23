@@ -1,24 +1,129 @@
 #ifdef RAVLIGHT_FIXTURE_ORION
 #include "fixture_webserver.h"
 #include "fixtures/orion/fixture.h"
+#include "fixtures/orion/motor_event_log.h"
+#include <esp_timer.h>
+#include <errno.h>
 #include "core/motor/IMotorDriver.h"
 #include "core/motor/backends/Tmc2209LocalDriver.h"
 #include "config.h"
 #include "dmx_manager.h"
 #include <ESPAsyncWebServer.h>
+#include <WebResponseImpl.h>
 #include <ArduinoJson.h>
 #include <esp_log.h>
+#include <memory>
+#include <new>
 
 static const char* TAG = "ORION_WEB";
 
-static bool rejectDuringPassiveBrakeTest(AsyncWebServerRequest* request) {
+class SgLogResponse final : public AsyncAbstractResponse {
+public:
+    using Entry = Tmc2209LocalDriver::SgLogEntry;
+
+    SgLogResponse(std::unique_ptr<Entry[]> entries, uint16_t count)
+        : _entries(std::move(entries)), _count(count) {
+        _code = 200;
+        _contentType = "application/json";
+        _contentLength = 2;
+        for (uint16_t i = 0; i < _count; ++i)
+            _contentLength += formatRow(nullptr, 0, i);
+    }
+
+    bool _sourceValid() const override { return true; }
+
+    size_t _fillBuffer(uint8_t* out, size_t capacity) override {
+        size_t written = 0;
+        while (written < capacity) {
+            if (_offset == _length) {
+                if (_closed) break;
+                _offset = 0;
+                if (!_opened) {
+                    _row[0] = '[';
+                    _length = 1;
+                    _opened = true;
+                } else if (_next < _count) {
+                    _length = formatRow(_row, sizeof(_row), _next++);
+                } else {
+                    _row[0] = ']';
+                    _length = 1;
+                    _closed = true;
+                }
+            }
+            const size_t bytes = min(_length - _offset, capacity - written);
+            memcpy(out + written, _row + _offset, bytes);
+            written += bytes;
+            _offset += bytes;
+        }
+        return written;
+    }
+
+private:
+    size_t formatRow(char* out, size_t size, uint16_t i) const {
+        const Entry& e = _entries[i];
+        return snprintf(out, size,
+            "%s{\"t\":%lu,\"sg\":%u,\"spd\":%ld,\"st\":%u,\"dg\":%u,\"gr\":%u,\"ig\":%u}",
+            i ? "," : "", static_cast<unsigned long>(e.t), static_cast<unsigned>(e.sg),
+            static_cast<long>(e.spd10) * 10, static_cast<unsigned>(e.state),
+            (e.flags >> 0) & 1u, (e.flags >> 1) & 1u, (e.flags >> 2) & 1u);
+    }
+
+    std::unique_ptr<Entry[]> _entries;
+    const uint16_t _count;
+    uint16_t _next = 0;
+    char _row[104]{};
+    size_t _offset = 0;
+    size_t _length = 0;
+    bool _opened = false;
+    bool _closed = false;
+};
+
+static bool parseSgLogParam(AsyncWebServerRequest* req, const char* key, uint64_t& result) {
+    if (!req->hasParam(key)) return true;
+    const String& value = req->getParam(key)->value();
+    char* end = nullptr;
+    errno = 0;
+    result = strtoull(value.c_str(), &end, 10);
+    return result && value[0] >= '0' && value[0] <= '9' && !*end && errno != ERANGE;
+}
+
+#ifdef ORION_HAS_LED
+static long orionFormLedInt(AsyncWebServerRequest* request, const char* base, uint8_t index, long fallback) {
+    const String key = String(base) + index;
+    return request->hasParam(key, true) ? request->getParam(key, true)->value().toInt() : fallback;
+}
+
+static void readOrionFormLedPatch(AsyncWebServerRequest* request, uint8_t index, led_output_cfg_t& output) {
+    output.protocol = static_cast<led_protocol_t>(orionFormLedInt(request, "orionLedProto", index, output.protocol));
+    output.pixel_count = orionFormLedInt(request, "orionLedCount", index, output.pixel_count);
+    output.universe_start = orionFormLedInt(request, "orionLedUniv", index, output.universe_start);
+    output.dmx_start = orionFormLedInt(request, "orionLedCh", index, output.dmx_start);
+    output.grouping = orionFormLedInt(request, "orionLedGroup", index, output.grouping);
+    if (!output.grouping) output.grouping = 1;
+}
+
+#ifdef RAVLIGHT_ORION_COMPACT_DMX_POOL
+bool reserveOrionFormDmxPatch(AsyncWebServerRequest* request, uint16_t motorUniverse) {
+    led_output_cfg_t outputs[HW_LED_OUTPUT_COUNT];
+    for (uint8_t i = 0; i < HW_LED_OUTPUT_COUNT; ++i) {
+        outputs[i] = orionConfig.ledOutputs[i];
+        readOrionFormLedPatch(request, i, outputs[i]);
+    }
+    return orionReserveDmxPatch(motorUniverse, outputs, HW_LED_OUTPUT_COUNT);
+}
+#endif
+#endif
+
+static bool rejectDuringPassiveBrakeTest(AsyncWebServerRequest* request,
+                                         bool allowHomedWebPosition = false) {
 #ifdef HW_MOTOR_PASSIVE_BRAKE_TEST
-    if (orionPassiveBrakeTestBusy()) {
+    if (orionPassiveBrakeTestBusy(allowHomedWebPosition)) {
         request->send(409, "text/plain", "Motor controls are blocked by braking or recovery");
         return true;
     }
 #else
     (void)request;
+    (void)allowHomedWebPosition;
 #endif
     return false;
 }
@@ -94,28 +199,17 @@ void handleFixtureSaveParams(AsyncWebServerRequest* request, bool& needsRestart)
     for (int i = 0; i < HW_LED_OUTPUT_COUNT; i++) {
         led_output_cfg_t& o = orionConfig.ledOutputs[i];
         String s = String(i);
-        auto ledInt = [&](const char* base, long def) -> long {
-            String k = String(base) + s;
-            return request->hasParam(k, true) ? request->getParam(k, true)->value().toInt() : def;
-        };
-        led_protocol_t newProto = (led_protocol_t)ledInt("orionLedProto", (int)o.protocol);
-        uint16_t       newCount = (uint16_t)ledInt("orionLedCount", o.pixel_count);
-        if (newProto != o.protocol || newCount != o.pixel_count) { needsRestart = true; changed = true; }
-        o.protocol    = newProto;
-        o.pixel_count = newCount;
-
-        uint16_t newUniv = (uint16_t)ledInt("orionLedUniv",  o.universe_start);
-        uint16_t newCh   = (uint16_t)ledInt("orionLedCh",    o.dmx_start);
-        uint8_t  newBri  = (uint8_t) ledInt("orionLedBri",   o.brightness);
-        uint8_t  newGrp  = (uint8_t) ledInt("orionLedGroup", o.grouping);
-        if (newGrp == 0) newGrp = 1;
+        const auto previous = o;
+        readOrionFormLedPatch(request, i, o);
+        if (o.protocol != previous.protocol || o.pixel_count != previous.pixel_count) {
+            needsRestart = true;
+            changed = true;
+        }
+        uint8_t  newBri  = orionFormLedInt(request, "orionLedBri", i, o.brightness);
         uint8_t  newInv  = request->hasParam("orionLedInv" + s, true) ? 1 : 0;
-        if (newUniv != o.universe_start || newCh != o.dmx_start || newBri != o.brightness ||
-            newGrp != o.grouping || newInv != o.invert) changed = true;
-        o.universe_start = newUniv;
-        o.dmx_start      = newCh;
+        if (o.universe_start != previous.universe_start || o.dmx_start != previous.dmx_start ||
+            o.grouping != previous.grouping || newBri != o.brightness || newInv != o.invert) changed = true;
         o.brightness     = newBri;
-        o.grouping       = newGrp;
         o.invert         = newInv;
 
         String ok = "orionLedOrder" + s;
@@ -203,6 +297,59 @@ static void addProfileTrace(JsonObject object, const Tmc2209LocalDriver::Profile
 #endif
 
 void registerFixtureRoutes(AsyncWebServer& server) {
+#ifdef RAVLIGHT_ORION_MOTOR_EVENT_LOG
+    server.on("/api/motor-events", HTTP_GET, [](AsyncWebServerRequest* req) {
+        uint64_t before = 0;
+        if (req->hasParam("before")) {
+            const String& value = req->getParam("before")->value();
+            char* end = nullptr;
+            errno = 0;
+            before = strtoull(value.c_str(), &end, 10);
+            if (!before || value[0] < '0' || value[0] > '9' || *end || errno == ERANGE) {
+                req->send(400, "text/plain", "before must be a positive event sequence");
+                return;
+            }
+        }
+        using namespace OrionMotorEvents;
+        Page snapshot;
+        page(before, snapshot);
+        DynamicJsonDocument doc(4096);
+        doc["bootId"] = snapshot.bootId;
+        doc["uptimeMs"] = static_cast<uint64_t>(esp_timer_get_time() / 1000ULL);
+        doc["capacity"] = Capacity;
+        doc["storageAvailable"] = snapshot.storageAvailable;
+        doc["storageWriteFailed"] = snapshot.storageWriteFailed;
+        doc["oldestSequence"] = snapshot.oldestSequence;
+        doc["newestSequence"] = snapshot.newestSequence;
+        doc["persistedThrough"] = snapshot.persistedThrough;
+        JsonArray items = doc.createNestedArray("events");
+        for (uint8_t i = 0; i < snapshot.count; ++i) {
+            const Event& event = snapshot.events[i];
+            JsonObject item = items.createNestedObject();
+            item["seq"] = event.sequence;
+            item["bootId"] = event.bootId;
+            item["uptimeMs"] = event.uptimeMs;
+            item["type"] = eventName(event.kind);
+            item["detail"] = event.detail;
+            if (event.kind >= Kind::MOTOR_FAULT) item["previous"] = event.previous;
+        }
+        if (snapshot.count && snapshot.events[snapshot.count - 1].sequence > snapshot.oldestSequence)
+            doc["nextBefore"] = snapshot.events[snapshot.count - 1].sequence;
+        if (doc.overflowed()) {
+            req->send(503, "text/plain", "Motor event response buffer unavailable");
+            return;
+        }
+        String out;
+        const size_t length = measureJson(doc);
+        if (!out.reserve(length) || serializeJson(doc, out) != length) {
+            req->send(503, "text/plain", "Motor event response buffer unavailable");
+            return;
+        }
+        auto* response = req->beginResponse(200, "application/json", out);
+        response->addHeader("Cache-Control", "no-store");
+        req->send(response);
+    });
+#endif
     // GET /motorstatus — JSON snapshot for UI polling
     server.on("/motorstatus", HTTP_GET, [](AsyncWebServerRequest* req) {
         IMotorDriver* drv = orionGetDriver();
@@ -339,24 +486,30 @@ void registerFixtureRoutes(AsyncWebServer& server) {
     server.on("/sglog", HTTP_GET, [](AsyncWebServerRequest* req) {
         Tmc2209LocalDriver* tmc = orionGetTmcDriver();
         if (!tmc) { req->send(503, "text/plain", "driver unavailable"); return; }
-        static Tmc2209LocalDriver::SgLogEntry buf[Tmc2209LocalDriver::SGLOG_N];
-        uint16_t n = tmc->sgLogSnapshot(buf, Tmc2209LocalDriver::SGLOG_N);
-        String out;
-        out.reserve(n * 48 + 16);
-        out += "[";
-        for (uint16_t i = 0; i < n; i++) {
-            if (i) out += ",";
-            out += "{\"t\":";   out += buf[i].t;
-            out += ",\"sg\":";  out += buf[i].sg;
-            out += ",\"spd\":"; out += (int32_t)buf[i].spd10 * 10;
-            out += ",\"st\":";  out += buf[i].state;
-            out += ",\"dg\":";  out += (buf[i].flags & 1) ? 1 : 0;
-            out += ",\"gr\":";  out += (buf[i].flags & 2) ? 1 : 0;
-            out += ",\"ig\":";  out += (buf[i].flags & 4) ? 1 : 0;
-            out += "}";
+        uint64_t before = 0;
+        uint64_t limit = req->hasParam("before") ? 32 : Tmc2209LocalDriver::SGLOG_N;
+        if (!parseSgLogParam(req, "before", before) || !parseSgLogParam(req, "limit", limit) ||
+            (req->hasParam("limit") && limit > 64)) {
+            req->send(400, "text/plain", "Use limit=1..64 and the X-Next-Before cursor");
+            return;
         }
-        out += "]";
-        req->send(200, "application/json", out);
+        auto entries = std::unique_ptr<SgLogResponse::Entry[]>(new (std::nothrow) SgLogResponse::Entry[limit]);
+        if (!entries) { req->send(503, "text/plain", "StallGuard snapshot unavailable"); return; }
+        uint16_t count = 0;
+        uint64_t next = 0;
+        if (!tmc->sgLogSnapshot(entries.get(), static_cast<uint16_t>(limit), before, count, next)) {
+            req->send(410, "text/plain", "StallGuard cursor expired; restart without before");
+            return;
+        }
+        auto* response = new (std::nothrow) SgLogResponse(std::move(entries), count);
+        if (!response) { req->send(503, "text/plain", "StallGuard response unavailable"); return; }
+        response->addHeader("Cache-Control", "no-store");
+        if (next) {
+            char cursor[21];
+            snprintf(cursor, sizeof(cursor), "%llu", static_cast<unsigned long long>(next));
+            response->addHeader("X-Next-Before", cursor);
+        }
+        req->send(response);
     });
 
     // GET /sglive — live StallGuard readout + motor state for the wizard's
@@ -541,7 +694,7 @@ void registerFixtureRoutes(AsyncWebServer& server) {
     // a concurrent DMX frame doesn't fight the drag; operator must
     // /release-dmx (or the console cycles Enable) to hand control back.
     server.on("/moveto", HTTP_POST, [](AsyncWebServerRequest* req) {
-        if (rejectDuringPassiveBrakeTest(req)) return;
+        if (rejectDuringPassiveBrakeTest(req, true)) return;
         IMotorDriver* drv = orionGetDriver();
         if (!drv) { req->send(503, "text/plain", "driver unavailable"); return; }
         if (!req->hasParam("pos", true)) {
@@ -549,8 +702,12 @@ void registerFixtureRoutes(AsyncWebServer& server) {
             return;
         }
         int32_t pos = req->getParam("pos", true)->value().toInt();
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+        orionQueueWebPosition(pos);
+#else
         drv->moveTo(pos);
         orionEnterManualOverride();
+#endif
         req->send(200, "text/plain", "ok");
     });
 

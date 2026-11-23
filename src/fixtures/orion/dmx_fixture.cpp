@@ -524,6 +524,18 @@ static std::atomic<GravityRecovery> g_recovery{GravityRecovery::IDLE};
 static std::atomic<uint32_t> g_recovery_frame_cutoff{0};
 static std::atomic<int32_t> g_recovery_resume_target{0};
 static std::atomic<const char*> g_recovery_failure{nullptr};
+static portMUX_TYPE g_web_position_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool g_web_position_pending = false;
+static int32_t g_web_position = 0;
+// The main loop owns web position dispatch and DMX position dispatch.
+static bool g_web_position_took_recovery_control = false;
+
+void orionQueueWebPosition(int32_t position) {
+    portENTER_CRITICAL(&g_web_position_lock);
+    g_web_position = position;
+    g_web_position_pending = true;
+    portEXIT_CRITICAL(&g_web_position_lock);
+}
 
 const char* orionGravityRecoveryFailure() {
     return g_recovery_failure.load();
@@ -677,9 +689,13 @@ static bool brakeTestBusy(BrakeTest state) {
     return state != BrakeTest::IDLE && state != BrakeTest::REFUSED && state != BrakeTest::FAILED;
 }
 
-bool orionPassiveBrakeTestBusy() {
+bool orionPassiveBrakeTestBusy(bool allowHomedWebPosition) {
 #ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
-    if (g_recovery.load() != GravityRecovery::IDLE) return true;
+    const auto recovery = g_recovery.load();
+    if (recovery != GravityRecovery::IDLE &&
+        !(allowHomedWebPosition && recovery == GravityRecovery::WAIT_FRAME)) return true;
+#else
+    (void)allowHomedWebPosition;
 #endif
     return brakeTestBusy(g_brake_test.load());
 }
@@ -884,7 +900,12 @@ void initFixture() {
              orionConfig.personality, orionConfig.positionStart,
              orionConfig.controlStart, dmxConfig.startUniverse);
 
+#ifdef RAVLIGHT_ORION_COMPACT_DMX_POOL
+    if (!registerDmxUniverse(dmxConfig.startUniverse))
+        ESP_LOGE(TAG, "Motor DMX unavailable: universe registration failed");
+#else
     registerDmxUniverse(dmxConfig.startUniverse);
+#endif
 
 #ifdef ORION_HAS_LED
     // LED strip outputs — init BEFORE the motor so they work even if the motor
@@ -894,13 +915,21 @@ void initFixture() {
         const led_output_cfg_t& cfg = orionConfig.ledOutputs[i];
         if (cfg.pixel_count == 0) continue;                                  // disabled
         if (cfg.protocol == LED_PWM || cfg.protocol == LED_RELAY) continue;  // pixel outputs only
+#ifdef RAVLIGHT_ORION_COMPACT_DMX_POOL
+        if (!orionReserveDmxPatch(dmxConfig.startUniverse, &cfg, 1)) {
+            ESP_LOGE(TAG, "LED ch%d unavailable: DMX universe registration failed", i);
+            continue;
+        }
+#endif
         uint8_t ch_pp = led_ch_per_pixel(cfg.protocol);
         esp_err_t err = led_output_init(&ledStrips[i], HW_LED_OUTPUT_PINS[i], cfg.pixel_count,
                                         i, 1, ch_pp);
         if (err == ESP_OK) {
             ledActive[i] = true;
+#ifndef RAVLIGHT_ORION_COMPACT_DMX_POOL
             uint8_t n = led_universe_count(&cfg);
             for (uint8_t u = 0; u < n; u++) registerDmxUniverse(cfg.universe_start + u);
+#endif
             ESP_LOGI(TAG, "LED ch%d gpio%d n=%d proto=%d univ=%d ch=%d", i,
                      HW_LED_OUTPUT_PINS[i], cfg.pixel_count, cfg.protocol,
                      cfg.universe_start, cfg.dmx_start);
@@ -1220,7 +1249,36 @@ void orionHighlightLed(int idx) {
 }
 #endif
 
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+static void serviceWebPosition() {
+    portENTER_CRITICAL(&g_web_position_lock);
+    const bool pending = g_web_position_pending;
+    const int32_t position = g_web_position;
+    g_web_position_pending = false;
+    portEXIT_CRITICAL(&g_web_position_lock);
+    if (!pending || !g_driver || orionPassiveBrakeTestBusy(true)) return;
+
+    const auto recovery = g_recovery.load();
+    if (recovery == GravityRecovery::WAIT_FRAME) {
+        const auto motor = g_driver->getStatus();
+        if (!motor.homed || motor.state != MotorState::IDLE || motor.fault_flags) return;
+        auto expected = GravityRecovery::WAIT_FRAME;
+        if (!g_recovery.compare_exchange_strong(expected, GravityRecovery::IDLE)) return;
+        g_web_position_took_recovery_control = true;
+        g_dmx_last_target = INT32_MIN;
+    } else if (recovery != GravityRecovery::IDLE) {
+        return;
+    }
+
+    orionEnterManualOverride();
+    g_driver->moveTo(position);
+}
+#endif
+
 void handleDMX() {
+#ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
+    serviceWebPosition();
+#endif
     if (!handleDMXenable) return;
 
 #ifdef ORION_HAS_LED
@@ -1243,8 +1301,11 @@ void handleDMX() {
     // would freeze us in the post-action state forever.
     uint32_t last_frame = getUniverseLastSeen(dmxConfig.startUniverse);
 #ifdef RAVLIGHT_ORION_GRAVITY_RECOVERY
-    if (recovery == GravityRecovery::WAIT_FRAME &&
-        !recoveryFrameCanResume(last_frame, g_recovery_frame_cutoff.load(), millis())) return;
+    if (recovery == GravityRecovery::WAIT_FRAME || g_web_position_took_recovery_control) {
+        // A frame buffered before home cannot take the motor back from the fader.
+        if (!recoveryFrameCanResume(last_frame, g_recovery_frame_cutoff.load(), millis())) return;
+        g_web_position_took_recovery_control = false;
+    }
 #endif
     static uint32_t prev_seen = 0;
     bool fresh_frame = (last_frame != 0) && (last_frame != prev_seen);

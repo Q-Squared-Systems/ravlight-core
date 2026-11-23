@@ -215,7 +215,8 @@ public:
     };
     static constexpr uint16_t SGLOG_N = 256;
     // Copy newest-first into caller's buffer; returns entries written.
-    uint16_t sgLogSnapshot(SgLogEntry* out, uint16_t max_entries) const;
+    bool sgLogSnapshot(SgLogEntry* out, uint16_t capacity, uint64_t before,
+                       uint16_t& count, uint64_t& nextBefore) const;
 
 private:
     bool    _jog_ignore_limits   = false;
@@ -234,6 +235,9 @@ private:
     SgLogEntry _sglog[SGLOG_N] = {};
     uint16_t   _sglog_head = 0;   // next write slot
     uint16_t   _sglog_used = 0;   // entries filled (caps at SGLOG_N)
+    mutable portMUX_TYPE _sglog_mux = portMUX_INITIALIZER_UNLOCKED;
+    uint32_t _sglog_boot = 0;
+    uint32_t _sglog_sequence = 0;
 
     // Post-stop grace timestamp. StallGuard4's SG_RESULT is speed-sensitive
     // — during a deceleration ramp the reading drops naturally as speed
@@ -268,6 +272,12 @@ private:
     void _stopOnOperationalDiag(int32_t speed_mhz);
     void _updateHoming();
     void _configureTmc();
+    void _setFaultFlags(uint8_t flags);
+#ifdef RAVLIGHT_ORION_MOTOR_EVENT_LOG
+    bool _tmcResetSeen = false;
+    uint8_t _thermalLevel = 0;
+    void _observeDriverStatus(uint8_t gstat, bool valid, bool atBoot = false);
+#endif
 #ifdef RAVLIGHT_TMC_STEALTHCHOP_TRIAL
     enum class ChopperMode : uint8_t { UNKNOWN, SPREAD_CYCLE, STEALTH_CHOP };
     std::atomic<ChopperMode> _idleChopperMode{ChopperMode::UNKNOWN};

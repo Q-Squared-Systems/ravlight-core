@@ -1,8 +1,10 @@
 #ifdef RAVLIGHT_HAS_MOTOR
 #include "core/motor/backends/Tmc2209LocalDriver.h"
+#include "fixtures/orion/motor_event_log.h"
 #include <Arduino.h>
 #include <string.h>
 #include <esp_log.h>
+#include <esp_system.h>
 #ifdef HW_MOTOR_RETAIN_ENABLE
 #include <driver/gpio.h>
 #include <soc/rtc_cntl_reg.h>
@@ -63,6 +65,7 @@ Tmc2209LocalDriver::~Tmc2209LocalDriver() {
 // ─── Lifecycle ───────────────────────────────────────────────────────────────
 
 bool Tmc2209LocalDriver::begin() {
+    _sglog_boot = esp_random();
 #ifdef HW_MOTOR_RETAIN_ENABLE
     // GPIO32 is the ESP32 X32P RTC pad. Read its hardware latch before
     // modifying the pin. This feature is enabled only on the v6 board.
@@ -91,6 +94,9 @@ bool Tmc2209LocalDriver::begin() {
         pins.sr = _tmc->IOIN();
         const uint32_t chopper = _tmc->CHOPCONF();
         const auto status = _tmc->GSTAT();
+#ifdef RAVLIGHT_ORION_MOTOR_EVENT_LOG
+        _observeDriverStatus(status, !_tmc->CRCerror, true);
+#endif
         driver_still_enabled = pins.version == 0x21 && !pins.enn &&
                                (chopper & 0x0F) != 0 && !_tmc->CRCerror && status == 0;
 #ifdef HW_MOTOR_PASSIVE_BRAKE_TEST
@@ -146,7 +152,7 @@ bool Tmc2209LocalDriver::begin() {
 #endif
     _setDriverEnabled(true);
     _state       = MotorState::IDLE;
-    _fault_flags = 0;
+    _setFaultFlags(0);
     _homed       = false;
 
     return true;
@@ -484,7 +490,7 @@ void Tmc2209LocalDriver::_instantStop() {
 void Tmc2209LocalDriver::triggerStall() {
     if (!_stepper) return;
     _instantStop();   // was forceStop() — same physical result, no queue trap
-    _fault_flags |= (uint8_t)MotorFault::STALL;
+    _setFaultFlags(_fault_flags | (uint8_t)MotorFault::STALL);
     _state = MotorState::FAULT;
     ESP_LOGW(TAG, "stall triggered by fixture (profile-based)");
 }
@@ -505,7 +511,7 @@ void Tmc2209LocalDriver::estop() {
     // (dedicated method), used e.g. by the drop-and-rehome recovery.
     _instantStop();
     _state        = MotorState::FAULT;
-    _fault_flags |= (uint8_t)MotorFault::DRIVER_ERROR;
+    _setFaultFlags(_fault_flags | (uint8_t)MotorFault::DRIVER_ERROR);
     ESP_LOGW(TAG, "E-STOP triggered (holding torque preserved)");
 }
 
@@ -550,7 +556,7 @@ void Tmc2209LocalDriver::disableSoftLimits() {
 bool Tmc2209LocalDriver::clearFault() {
     if (_state != MotorState::FAULT && _state != MotorState::DRIVER_OFF) {
         // Nothing to clear — but still reset flags in case they accumulated
-        _fault_flags = 0;
+        _setFaultFlags(0);
         return true;
     }
     if (!_tmc) {
@@ -568,7 +574,7 @@ bool Tmc2209LocalDriver::clearFault() {
     }
     if (_tmc->test_connection() != 0) {
         ESP_LOGW(TAG, "clearFault: UART not responding — refusing to clear");
-        _fault_flags |= (uint8_t)MotorFault::DRIVER_ERROR;
+        _setFaultFlags(_fault_flags | (uint8_t)MotorFault::DRIVER_ERROR);
         return false;
     }
 
@@ -584,7 +590,7 @@ bool Tmc2209LocalDriver::clearFault() {
                      && (_fault_flags & (uint8_t)MotorFault::STALL) != 0;
 
     // All sticky conditions cleared — reset flags, re-enable, return to IDLE
-    _fault_flags = 0;
+    _setFaultFlags(0);
     _stall_isr_flag = false;
     _setDriverEnabled(true);
     _state = MotorState::IDLE;
@@ -670,6 +676,9 @@ bool Tmc2209LocalDriver::verifyRecoveryDriver() {
     if (_tmc->CRCerror || pins.version != 0x21 || pins.enn) return false;
     GSTAT_t general{};
     general.sr = _tmc->GSTAT();
+#ifdef RAVLIGHT_ORION_MOTOR_EVENT_LOG
+    _observeDriverStatus(general.sr, !_tmc->CRCerror);
+#endif
     if (_tmc->CRCerror || general.reset || general.drv_err || general.uv_cp) return false;
     TMC2208_n::DRV_STATUS_t status{};
     status.sr = _tmc->DRV_STATUS();
@@ -796,7 +805,7 @@ bool Tmc2209LocalDriver::endPassiveBrakeTest() {
     }
     _homed = false;
     _state = MotorState::FAULT;
-    _fault_flags |= static_cast<uint8_t>(MotorFault::DRIVER_ERROR);
+    _setFaultFlags(_fault_flags | static_cast<uint8_t>(MotorFault::DRIVER_ERROR));
     ESP_LOGE(TAG, "Unable to verify holding-current restore after passive brake test");
     return false;
 }
@@ -839,14 +848,30 @@ uint16_t Tmc2209LocalDriver::getStallGuardResult() {
     return _sg_result;
 }
 
-uint16_t Tmc2209LocalDriver::sgLogSnapshot(SgLogEntry* out, uint16_t max_entries) const {
-    uint16_t n = (_sglog_used < max_entries) ? _sglog_used : max_entries;
-    // newest first: head-1 backwards
-    for (uint16_t i = 0; i < n; i++) {
-        uint16_t idx = (uint16_t)((_sglog_head + SGLOG_N - 1 - i) % SGLOG_N);
-        out[i] = _sglog[idx];
+bool Tmc2209LocalDriver::sgLogSnapshot(SgLogEntry* out, uint16_t capacity, uint64_t before,
+                                      uint16_t& count, uint64_t& nextBefore) const {
+    count = 0;
+    nextBefore = 0;
+    portENTER_CRITICAL(&_sglog_mux);
+    const uint32_t oldest = _sglog_sequence - _sglog_used + 1;
+    const uint32_t cursor = static_cast<uint32_t>(before);
+    const bool expired = before && (static_cast<uint32_t>(before >> 32) != _sglog_boot ||
+                                    cursor <= oldest || cursor > _sglog_sequence);
+    if (!expired) {
+        const uint16_t skip = before ? _sglog_sequence - cursor + 1 : 0;
+        const uint16_t available = _sglog_used - skip;
+        count = available < capacity ? available : capacity;
+        for (uint16_t i = 0; i < count; ++i) {
+            const uint16_t index = (_sglog_head + SGLOG_N - 1 - skip - i) % SGLOG_N;
+            out[i] = _sglog[index];
+        }
+        if (count < available) {
+            nextBefore = (static_cast<uint64_t>(_sglog_boot) << 32) |
+                         (_sglog_sequence - skip - count + 1);
+        }
     }
-    return n;
+    portEXIT_CRITICAL(&_sglog_mux);
+    return !expired;
 }
 
 // Run the motor at homing speed with the stall fault suppressed, so the operator
@@ -1066,7 +1091,7 @@ void Tmc2209LocalDriver::update() {
         // Diagnostic ring buffer — one sample per register read. Dumped by
         // the /sglog HTTP route so block-tests can be analysed offline.
         {
-            SgLogEntry& e = _sglog[_sglog_head];
+            SgLogEntry e{};
             e.t     = now;
             e.sg    = _sg_result;
             e.spd10 = (int16_t)(_stepper->getCurrentSpeedInMilliHz() / 10000);
@@ -1074,8 +1099,12 @@ void Tmc2209LocalDriver::update() {
             e.flags = (uint8_t)((digitalRead(_diag_pin) ? 1 : 0)
                     | ((int32_t)(_stop_grace_until_ms - now) > 0 ? 2 : 0)
                     | (_jog_ignore_stall ? 4 : 0));
+            portENTER_CRITICAL(&_sglog_mux);
+            _sglog[_sglog_head] = e;
             _sglog_head = (_sglog_head + 1) % SGLOG_N;
             if (_sglog_used < SGLOG_N) _sglog_used++;
+            ++_sglog_sequence;
+            portEXIT_CRITICAL(&_sglog_mux);
         }
 
         // Level-based stall fallback. The DIAG ISR is edge-triggered: if
@@ -1095,7 +1124,7 @@ void Tmc2209LocalDriver::update() {
                 if (++_op_sg_low_count >= 3) {
                     _op_sg_low_count = 0;
                     _instantStop();
-                    _fault_flags |= (uint8_t)MotorFault::STALL;
+                    _setFaultFlags(_fault_flags | (uint8_t)MotorFault::STALL);
                     _state = MotorState::FAULT;
                     ESP_LOGW(TAG, "stall via SG level (sg=%u < %u, spd=%d mHz)",
                              (unsigned)_sg_result, (unsigned)trip, spd_mhz);
@@ -1239,6 +1268,9 @@ void Tmc2209LocalDriver::_stopOnOperationalDiag(int32_t speed_mhz) {
     GSTAT_t gstat{};
     gstat.sr = _tmc->GSTAT();
     const bool gstat_valid = !_tmc->CRCerror;
+#ifdef RAVLIGHT_ORION_MOTOR_EVENT_LOG
+    _observeDriverStatus(gstat.sr, gstat_valid);
+#endif
     TMC2208_n::DRV_STATUS_t drv_status{};
     drv_status.sr = _tmc->DRV_STATUS();
     const bool drv_status_valid = !_tmc->CRCerror;
@@ -1247,10 +1279,10 @@ void Tmc2209LocalDriver::_stopOnOperationalDiag(int32_t speed_mhz) {
         (drv_status_valid && (drv_status.ot || drv_status.s2ga || drv_status.s2gb ||
                               drv_status.s2vsa || drv_status.s2vsb));
     if (_sgthrs_active == 0 || driver_error) {
-        _fault_flags |= static_cast<uint8_t>(MotorFault::DRIVER_ERROR);
+        _setFaultFlags(_fault_flags | static_cast<uint8_t>(MotorFault::DRIVER_ERROR));
         if (_invalidate_home_on_stall) _homed = false;
     } else {
-        _fault_flags |= static_cast<uint8_t>(MotorFault::STALL);
+        _setFaultFlags(_fault_flags | static_cast<uint8_t>(MotorFault::STALL));
     }
     Serial.printf("[TMC2209] DIAG stop: speed=%ld mHz SGTHRS=%u GSTAT=0x%02x (%s) DRV_STATUS=0x%08lx (%s)\n",
                   static_cast<long>(speed_mhz), static_cast<unsigned>(_sgthrs_active),
@@ -1287,7 +1319,21 @@ void Tmc2209LocalDriver::_readRegisters() {
     // chip-specific accessors instead of raw bit math. The accessors include
     // CRC retry logic that a direct register read does not.
     bool otpw = _tmc->otpw();   // over-temperature pre-warning (~120 °C)
+#ifdef RAVLIGHT_ORION_MOTOR_EVENT_LOG
+    const bool warningValid = !_tmc->CRCerror;
+#endif
     bool ot   = _tmc->ot();     // over-temperature shutdown (~150 °C)
+#ifdef RAVLIGHT_ORION_MOTOR_EVENT_LOG
+    if (warningValid && !_tmc->CRCerror) {
+        using namespace OrionMotorEvents;
+        const uint8_t thermal = ot ? 2 : otpw ? 1 : 0;
+        if (thermal != _thermalLevel) {
+            record(thermal == 2 ? Kind::THERMAL_SHUTDOWN : thermal == 1 ? Kind::THERMAL_WARNING : Kind::THERMAL_CLEAR,
+                   thermal, _thermalLevel);
+            _thermalLevel = thermal;
+        }
+    }
+#endif
     bool s2ga = _tmc->s2ga();   // short to GND phase A
     bool s2gb = _tmc->s2gb();   // short to GND phase B
     // GSTAT.uv_cp — charge-pump supply undervoltage. Unlike the DRV_STATUS
@@ -1295,24 +1341,57 @@ void Tmc2209LocalDriver::_readRegisters() {
     // (e.g. a 12 V supply on a board meant for 24 V — boots the ESP32 fine
     // but the driver never had enough voltage to run) until we clear it, so
     // capture it into our own _fault_flags and clear the chip latch here.
-    if (_tmc->uv_cp()) {
-        _fault_flags |= (uint8_t)MotorFault::UNDERVOLTAGE;
+#ifdef RAVLIGHT_ORION_MOTOR_EVENT_LOG
+    GSTAT_t general{};
+    general.sr = _tmc->GSTAT(); // Same UART read as the original uv_cp() accessor.
+    _observeDriverStatus(general.sr, !_tmc->CRCerror);
+    const bool undervoltage = general.uv_cp;
+#else
+    const bool undervoltage = _tmc->uv_cp();
+#endif
+    if (undervoltage) {
+        _setFaultFlags(_fault_flags | (uint8_t)MotorFault::UNDERVOLTAGE);
         ESP_LOGE(TAG, "TMC2209 undervoltage on charge pump — check supply voltage");
         _tmc->GSTAT(0x07);   // clear reset/drv_err/uv_cp latches
     }
 
     if (ot || otpw) {
-        _fault_flags |= (uint8_t)MotorFault::OVERTEMP;
+        _setFaultFlags(_fault_flags | (uint8_t)MotorFault::OVERTEMP);
         _driver_temp  = ot ? 150 : 120;
         if (ot) ESP_LOGE(TAG, "TMC2209 overtemperature shutdown!");
     } else {
-        _fault_flags &= ~(uint8_t)MotorFault::OVERTEMP;
+        _setFaultFlags(_fault_flags & ~(uint8_t)MotorFault::OVERTEMP);
     }
     if (s2ga || s2gb) {
-        _fault_flags |= (uint8_t)MotorFault::OVERCURRENT;
+        _setFaultFlags(_fault_flags | (uint8_t)MotorFault::OVERCURRENT);
         ESP_LOGE(TAG, "TMC2209 short to GND detected");
     }
 }
+
+void Tmc2209LocalDriver::_setFaultFlags(uint8_t flags) {
+#ifdef RAVLIGHT_ORION_MOTOR_EVENT_LOG
+    const uint8_t previous = _fault_flags;
+#endif
+    _fault_flags = flags;
+#ifdef RAVLIGHT_ORION_MOTOR_EVENT_LOG
+    using namespace OrionMotorEvents;
+    if (flags & ~previous) record(Kind::MOTOR_FAULT, flags, previous);
+    if (previous & ~flags) record(Kind::MOTOR_FAULT_CLEAR, flags, previous);
+#endif
+}
+
+#ifdef RAVLIGHT_ORION_MOTOR_EVENT_LOG
+void Tmc2209LocalDriver::_observeDriverStatus(uint8_t gstat, bool valid, bool atBoot) {
+    if (!valid) return;
+    const bool reset = (gstat & 1) != 0;
+    if (reset && !_tmcResetSeen) {
+        using namespace OrionMotorEvents;
+        record(atBoot ? Kind::TMC_RESET_AT_BOOT : Kind::TMC_RESET, gstat);
+    }
+    // The existing recovery checks own GSTAT. Logging never clears its latch.
+    _tmcResetSeen = reset;
+}
+#endif
 
 void IRAM_ATTR Tmc2209LocalDriver::_diagIsrCb(void* arg) {
     Tmc2209LocalDriver* drv = static_cast<Tmc2209LocalDriver*>(arg);

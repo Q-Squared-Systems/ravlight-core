@@ -261,6 +261,9 @@ struct OrionConfig {
 };
 
 extern OrionConfig orionConfig;
+#ifdef RAVLIGHT_ORION_COMPACT_DMX_POOL
+bool orionReserveDmxPatch(uint16_t motorUniverse, const led_output_cfg_t* outputs, uint8_t outputCount);
+#endif
 
 // Steps per cm of real fixture travel, derived from the mechanical calibration.
 float orionStepsPerCm();
@@ -278,11 +281,12 @@ Tmc2209LocalDriver* orionGetTmcDriver();
 const char* orionGravityRecoveryStatus();
 const char* orionGravityRecoveryFailure();
 bool orionGravityReturnInProgress();
+void orionQueueWebPosition(int32_t position);
 #endif
 #ifdef HW_MOTOR_PASSIVE_BRAKE_TEST
 bool orionStartPassiveBrakeTest();
 bool orionStopPassiveBrakeTest(bool emergency = false);
-bool orionPassiveBrakeTestBusy();
+bool orionPassiveBrakeTestBusy(bool allowHomedWebPosition = false);
 const char* orionPassiveBrakeTestStatus();
 #endif
 
